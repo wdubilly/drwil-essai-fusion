@@ -1,0 +1,245 @@
+import { afterEach, test } from "node:test";
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const SCRIPT = fileURLToPath(new URL("./dashboard.mjs", import.meta.url));
+let dossiers = [];
+afterEach(() => {
+  for (const d of dossiers) rmSync(d, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  dossiers = [];
+});
+
+/** Génère le tableau de bord du projet `fichiers` ; rend le HTML produit à `sortie`. */
+function generer(fichiers, args = [], sortie = "docs/dashboard.html") {
+  const racine = mkdtempSync(join(tmpdir(), "drwil-tableau-"));
+  dossiers.push(racine);
+  mkdirSync(join(racine, "docs"));
+  for (const [chemin, contenu] of Object.entries(fichiers)) {
+    mkdirSync(dirname(join(racine, chemin)), { recursive: true });
+    writeFileSync(join(racine, chemin), contenu);
+  }
+  const r = spawnSync(process.execPath, [SCRIPT, ...args], { cwd: racine, encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok([`Tableau de bord généré : ${sortie}\n`, `Dashboard generated: ${sortie}\n`].includes(r.stdout), r.stdout);
+  return readFileSync(join(racine, sortie), "utf8");
+}
+
+test("projet complet en français : index, fiches et lots, contrats, audits, consommation", () => {
+  const html = generer(
+    {
+      ".drwil/ia-first.json": JSON.stringify({ projectName: "Démo <x>" }),
+      "docs/projects/pending.md": "# Index\n\n- [ ] [IA] ouvert & à faire\n- [x] [IA] fait\ntexte\n",
+      "docs/projects/a.md": [
+        "# Fiche A",
+        "",
+        "**Statut** (2026-01-01) : en cours.",
+        "",
+        "## 6. Lots",
+        "",
+        "- **Lot 1** [IA] : premier",
+        "- **Lot 2** [à voir] second",
+        "texte libre",
+        "## Reprise",
+        "- **Hors lots** [IA] : ignoré",
+      ].join("\n"),
+      "docs/projects/b.md": "sans titre ni statut\n",
+      "docs/projects/modele-fiche.md": "# Gabarit exclu\n",
+      "docs/projects/sous/c.md": "# Ignorée (sous-dossier)\n",
+      "docs/contracts.md": [
+        "## QUA-001 — un",
+        "",
+        "**Règle** : règle un",
+        "## QUA-002 — sans règle",
+        "## Pas un identifiant",
+        "| ID | Règle |",
+        "|---|---|",
+        "| SEC-001 | règle tableau |",
+        "| SEC-002 |",
+        "| texte | libre |",
+      ].join("\n"),
+      "docs/contracts-catalog.md": "| catalogue:QUA-004 | seuil |\n",
+      ".drwil/usage.jsonl": [
+        JSON.stringify({ workstream: "a", tokens: 10, duration_min: 2, model: "m1" }),
+        "",
+        "pas du json",
+        JSON.stringify({ tokens: 5 }),
+        JSON.stringify({ workstream: "a", tokens: "x", model: "m2" }),
+        JSON.stringify({ workstream: "b" }),
+      ].join("\n"),
+      "docs/audit-risques.md":
+        "# Audit risques\n\n> Dernier scan : 2020-01-01\n> suite de la valeur\n> Périmètre : tout\n\n> hors du premier bloc : x\n",
+      "docs/decouverte-valeur.md": "> sans deux-points\n> Dernier scan : jamais\n",
+    },
+    ["docs/sortie.html"],
+    "docs/sortie.html",
+  );
+  assert.match(html, /<html lang="fr">/);
+  assert.match(html, /Tableau de bord — Démo &lt;x&gt;/);
+  assert.match(html, /☐ \[IA\] ouvert &amp; à faire/);
+  assert.match(html, /class="done">☑ \[IA\] fait/);
+  assert.match(html, /Fiche A <small>\(<code>docs\/projects\/a\.md<\/code>/);
+  assert.match(html, /Statut : en cours\./);
+  assert.match(html, /\[IA\]<\/span> <strong>Lot 1<\/strong> — premier/);
+  assert.match(html, /\[à voir\]<\/span> <strong>Lot 2<\/strong> — second/);
+  assert.doesNotMatch(html, /Hors lots|Gabarit exclu|Ignorée|Pas un identifiant|>texte</);
+  assert.match(html, /<h3>\? <small>\(<code>docs\/projects\/b\.md/);
+  assert.match(html, /\(pas de ligne Statut\)/);
+  assert.match(html, /<code>QUA-001<\/code><\/td><td>règle un</);
+  assert.match(html, /<code>QUA-002<\/code><\/td><td><\/td>/);
+  assert.match(html, /<code>SEC-001<\/code><\/td><td>règle tableau</);
+  assert.match(html, /<code>SEC-002<\/code><\/td><td><\/td>/);
+  assert.match(html, /Au catalogue, non installés \(docs\/contracts-catalog\.md\)<\/h3><table>.*catalogue:QUA-004/s);
+  assert.match(html, /Dernier scan : 2020-01-01 suite de la valeur<br>Périmètre : tout <strong>⚠ scan vieux de \d+ jours/);
+  assert.doesNotMatch(html, /hors du premier bloc/);
+  assert.match(html, /<h3> <small>\(<code>docs\/decouverte-valeur\.md<\/code>\)<\/small><\/h3><p>Dernier scan : jamais<\/p>/);
+  assert.match(html, /<code>a<\/code><\/td><td>10<\/td><td>2<\/td><td>m1, m2</);
+  assert.match(html, /<code>b<\/code><\/td><td>0<\/td><td>0<\/td><td><\/td>/);
+});
+
+test("projet vide en anglais, dossiers réglés : chaque section dit son absence", () => {
+  const html = generer({
+    ".drwil/ia-first.json": JSON.stringify({ lang: "en", dirs: { projects: "suivi", index: "suivi/index.md", contracts: "regles.md" } }),
+    "suivi/index.md": "# Index\n\nnothing yet\n",
+    "docs/audit-risks.md": "# Risks\n\n> Last scan : 2999-01-01\n",
+    "docs/value-discovery.md": "# Value\n\n> Scope : all\n",
+  });
+  assert.match(html, /<html lang="en">/);
+  assert.match(html, /Dashboard — /);
+  assert.match(html, /\(no checkbox found\)/);
+  assert.match(html, /\(no brief\)/);
+  assert.match(html, /Installed \(regles\.md — project baseline\)<\/h3><p>\(none\)/);
+  assert.match(html, /In the catalog, not installed \(docs\/contracts-catalog\.md\)<\/h3><p>\(none\)/);
+  assert.match(html, /Last scan : 2999-01-01<\/p>/);
+  assert.match(html, /Scope : all<\/p>/);
+  assert.match(html, /\(\.drwil\/usage\.jsonl missing/);
+});
+
+test("sans configuration ni index : index absent, audits pas encore générés", () => {
+  const html = generer({ "docs/projects/a.md": "# A\n\nStatut : ouvert\n" });
+  assert.match(html, /Chantiers en attente<\/h2>\n<p>\(absent\)<\/p>/);
+  assert.match(html, /Statut : ouvert/);
+  assert.match(html, /\(docs\/audit-risques\.md absent — pas encore généré/);
+  assert.match(html, /\(\.drwil\/usage\.jsonl absent/);
+});
+
+test("sans dossier de fiches : aucune fiche, en français", () => {
+  assert.match(generer({}), /\(aucune fiche\)/);
+});
+
+test("maturité : fiches triées prêtes d'abord, « à affiner » en dernier, champ affiché tel qu'écrit (FR et EN)", () => {
+  const html = generer({
+    "docs/projects/aa.md": "# Fiche AA\n\n**Statut** : cadré.\n**Maturité** : à affiner — 2 points\n",
+    "docs/projects/bb.md": "# Fiche BB\n\n**Statut** : cadré.\n**Maturité** : prêt\n",
+    "docs/projects/cc.md": "# Fiche CC\n\n**Statut** : cadré.\n",
+  });
+  const ordre = ["Fiche BB", "Fiche CC", "Fiche AA"].map((t) => html.indexOf(t));
+  assert.ok(ordre.every((n) => n > 0) && ordre[0] < ordre[1] && ordre[1] < ordre[2], ordre.join());
+  assert.match(html, /Maturité : prêt/);
+  assert.match(html, /Maturité : à affiner — 2 points/);
+  assert.equal(html.split("Maturité :").length - 1, 2, "pas de ligne Maturité pour une fiche sans le champ");
+  const en = generer({
+    ".drwil/ia-first.json": JSON.stringify({ lang: "en" }),
+    "docs/projects/a.md": "# A\n\n**Status**: open\n**Maturity**: to refine\n",
+    "docs/projects/b.md": "# B\n\n**Status**: open\n**Maturity**: ready\n",
+  });
+  assert.match(en, /Maturity: to refine/);
+  assert.ok(en.indexOf("# B") < 0 && en.indexOf(">B <") < en.indexOf(">A <"));
+});
+
+test("en anglais : statut d'une fiche, audit périmé, audit pas encore généré", () => {
+  const html = generer({
+    ".drwil/ia-first.json": JSON.stringify({ lang: "en" }),
+    "docs/projects/a.md": "# A\n\n**Status**: open\n",
+    "docs/audit-risks.md": "# Risks\n\n> Last scan: 2020-01-01\n",
+  });
+  assert.match(html, /Status: open/);
+  assert.match(html, /⚠ scan \d+ days old, time to re-run/);
+  assert.match(html, /\(docs\/value-discovery\.md missing — not generated yet/);
+});
+
+const ligneCache = (workstream, requests, cache_read) => JSON.stringify({ workstream, requests, cache_read });
+
+test("QUA-198 tendances : durée de CI à hooks inchangés et cache lu par requête, dérive affichée sans refus", () => {
+  const html = generer({
+    "docs/projects/journal.md": [
+      "## 2026-10-01 — a",
+      "- **Durée de CI (job checks)** : 3m02 — PR #1 — hooks modifiés",
+      "- **Durée de CI (job checks)** : 2m10 — PR #2 — hooks inchangés",
+      "## 2026-10-02 — b",
+      "- **Durée de CI (job checks)** : 200 s — PR #3 — hooks inchangés",
+      "- **Durée de CI (job checks)** : non mesurée — pas encore passée",
+      "## 2026-10-03 — c",
+      "- **Durée de CI (job checks)** : 6m00 — PR #4 — hooks inchangés",
+      "## 2026-10-04 — d",
+      "- **Durée de CI (job checks)** : 6m00 — PR #5 — hooks inchangés",
+      "## 2026-10-05 — e",
+      "- **Durée de CI (job checks)** : 6m00 — PR #6 — hooks inchangés",
+      "## 2026-10-06 — f",
+      "- **Durée de CI (job checks)** : 6m00 — PR #7 — hooks inchangés",
+    ].join("\n"),
+    ".drwil/usage.jsonl": [
+      ligneCache("x", 10, 3000000),
+      ligneCache("y", 0, 5),
+      ligneCache("z", 2, 0),
+      ligneCache("w", 5, 1000000),
+      "pas du json",
+    ].join("\n"),
+  });
+  assert.match(html, /Tendances \(indicateurs, jamais bloquants\)/);
+  assert.doesNotMatch(html, /2026-10-01 : |: 182/, "hooks modifiés ignorés, seuls les cinq derniers relevés montrés");
+  assert.match(html, /2026-10-02 : 200<br>2026-10-03 : 360<br>/);
+  assert.match(html, /<strong>⚠ dérive : moyenne 328 au-dessus du seuil 235<\/strong>/);
+  assert.match(html, /x : 300000<br>w : 200000<\/p>/);
+  assert.match(html, /<strong>⚠ dérive : moyenne 250000 au-dessus du seuil 212500<\/strong>/);
+});
+
+test("QUA-198 tendances : sous le seuil, sans relevé, et en anglais", () => {
+  const sous = generer({
+    "docs/projects/journal.md": "## 2026-10-02 — b\n- **Durée de CI (job checks)** : 2m00 — PR — hooks inchangés\n",
+    ".drwil/usage.jsonl": ligneCache("x", 10, 1000000),
+  });
+  assert.match(sous, /<p>moyenne 120, seuil d'alerte 235<\/p>/);
+  assert.match(sous, /<p>moyenne 100000, seuil d'alerte 212500<\/p>/);
+  assert.doesNotMatch(sous, /dérive/);
+  assert.equal(generer({}).split("(aucun relevé)").length - 1, 2);
+  const en = generer({
+    ".drwil/ia-first.json": JSON.stringify({ lang: "en", dirs: { projects: "suivi", index: "suivi/index.md" } }),
+    "suivi/journal.md": "## 2026-10-02 — b\n- **Durée de CI (job checks)** : 9m00 — PR — hooks unchanged\n",
+  });
+  assert.match(en, /Trends \(indicators, never blocking\)/);
+  assert.match(en, /⚠ drift: mean 540 above the threshold 235/);
+  assert.match(en, /\(no reading\)/);
+});
+
+test("QUA-307 : le tableau de bord lit les lignes anciennes et les lignes réparties par activité, sans erreur ni vue neuve", () => {
+  const html = generer({
+    ".drwil/usage.jsonl": [
+      JSON.stringify({ workstream: "ancien", tokens: 10, duration_min: 2, model: "m1" }),
+      JSON.stringify({
+        workstream: "reparti",
+        increment: "all",
+        tokens: 30,
+        requests: 3,
+        cache_read: 6,
+        duration_min: 4,
+        model: "m2",
+        source: "claude-code-logs+copilot-cli-logs",
+        tools: { "claude-code": { tokens: 20 }, "copilot-cli": { tokens: 10 } },
+        activities: {
+          production: { tokens: 15, requests: 1 },
+          verification: { tokens: 5, requests: 1 },
+          governance: { tokens: 10, requests: 1 },
+          unattributed: { tokens: 0, requests: 0 },
+        },
+      }),
+    ].join("\n"),
+  });
+  assert.match(html, /<code>ancien<\/code><\/td><td>10<\/td><td>2<\/td><td>m1</);
+  assert.match(html, /<code>reparti<\/code><\/td><td>30<\/td><td>4<\/td><td>m2</);
+  // Le dossier temporaire du projet est affiché par la page ; en CI, son chemin contient « gouvernance ».
+  assert.doesNotMatch(html.replaceAll(dossiers.at(-1), ""), /production|governance|gouvernance/);
+});

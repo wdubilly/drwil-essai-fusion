@@ -1,0 +1,200 @@
+// Grammar of the `scope` block of workstream briefs (docs/projects/*.md).
+//
+// Single source of the grammar: check-docs.mjs and the agent's reminder (.claude/hooks/scope-reminder.mjs) import it.
+// A brief in docs/projects/ may carry, in an HTML comment:
+//
+//     <!-- scope
+//     files:
+//       - backend/app/routers/scripts.py
+//       - frontend/src/components/Script*
+//     -->
+//
+// A code file is covered if it matches a pattern (fnmatch style) of a brief, or is derived from it (scope-derived.mjs);
+// a file already delivered on the main branch stays covered by default. Never throws on an unreadable brief.
+
+import { execFileSync } from "node:child_process";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const BLOCK_RE = /<!--[ \t]*scope[ \t]*\r?\n([\s\S]*?)-->/;
+const ENTRY_RE = /^-[ \t]+(\S+)$/;
+const WILDCARDS = new Set(["*", "?", "["]);
+
+/** Path relative to the root, `/` separators, no leading `./`. */
+export function normalize(path) {
+  let p = String(path).replace(/\\/g, "/").trim();
+  while (p.startsWith("./")) p = p.slice(2);
+  return p;
+}
+
+/**
+ * The reminder's scope: the project's code and its configuration; never
+ * docs/ nor a .md, so that the agent can always write its brief.
+ * Read from the project config (.drwil/ia-first.json): layers, generic code
+ * folders, extra files and patterns, CI files.
+ */
+export function isCode(path, cfg = {}) {
+  const p = normalize(path);
+  if (!p || p.startsWith("docs/") || /\.md$/i.test(p)) return false;
+  const prefixes = [...(cfg.layers ?? []), ...(cfg.layerPrefixes ?? []), ...(cfg.codePrefixes ?? [])].map((x) => `${x}/`);
+  if (prefixes.some((x) => p.startsWith(x))) return true;
+  if ((cfg.extraCodeFiles ?? []).includes(p)) return true;
+  if ((cfg.ciFiles ?? []).includes(p)) return true;
+  return (cfg.extraCodeGlobs ?? []).some((g) => fnmatch(p, g));
+}
+
+/** fnmatch style: `*` and `?` cross `/`, the rest is literal. */
+export function fnmatch(path, pattern) {
+  const re = pattern
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*/g, ".*")
+    .replace(/\?/g, ".");
+  return new RegExp(`^${re}$`).test(path);
+}
+
+/** A pattern must name at least two folders before its first wildcard
+ * (`backend/app/x*` yes, `backend/*` or `**` no): otherwise it covers a whole
+ * tree and the reminder says nothing any more. */
+export function tooBroad(pattern) {
+  if (pattern.includes("**")) return true;
+  const first = [...pattern].findIndex((c) => WILDCARDS.has(c));
+  if (first === -1) return false;
+  return (pattern.slice(0, first).match(/\//g) ?? []).length < 2;
+}
+
+/**
+ * Valid patterns and problems of a brief's `scope` block. No block:
+ * `{ patterns: [], problems: [] }`. A too broad pattern is reported and removed
+ * from the valid patterns.
+ */
+export function readBlock(text) {
+  const m = BLOCK_RE.exec(text);
+  if (!m) return { patterns: [], problems: [] };
+  const patterns = [];
+  const problems = [];
+  let header = false;
+  for (const raw of m[1].split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (!header) {
+      if (line === "files:") header = true;
+      else problems.push({ kind: "header", line });
+      continue;
+    }
+    const entry = ENTRY_RE.exec(line);
+    if (entry) patterns.push(normalize(entry[1]));
+    else problems.push({ kind: "line", line });
+  }
+  if (!header && problems.length === 0) problems.push({ kind: "header", line: "" });
+  const valid = [];
+  for (const pattern of patterns) {
+    if (tooBroad(pattern)) problems.push({ kind: "broad", pattern });
+    else valid.push(pattern);
+  }
+  return { patterns: valid, problems };
+}
+
+/**
+ * Patterns completed by the copies the project declares (`scopeMirrors` of .drwil/ia-first.json, pairs
+ * of path prefixes `{ "from": "templates/", "to": "" }`): a pattern under `from` also covers the same
+ * path under `to`. Lets a brief name the source of a generated copy without listing the copy (QUA-035).
+ */
+export function withMirrors(patterns, cfg = {}) {
+  const mirrors = (Array.isArray(cfg?.scopeMirrors) ? cfg.scopeMirrors : []).filter(
+    (m) => typeof m?.from === "string" && m.from && typeof m.to === "string",
+  );
+  const all = [...patterns];
+  for (const p of patterns) for (const m of mirrors) if (p.startsWith(m.from)) all.push(normalize(m.to + p.slice(m.from.length)));
+  return [...new Set(all)];
+}
+
+/** `{ brief (relative path): patterns }` for the briefs whose block reads without a form error, copies included. */
+export function patternsByBrief(briefTexts, cfg = {}) {
+  const result = new Map();
+  for (const [rel, text] of briefTexts) {
+    const patterns = withMirrors(readBlock(text).patterns, cfg);
+    if (patterns.length) result.set(rel, patterns);
+  }
+  return result;
+}
+
+export function briefsCovering(path, byBrief) {
+  const p = normalize(path);
+  const briefs = [];
+  for (const [brief, patterns] of byBrief) if (patterns.some((g) => fnmatch(p, g))) briefs.push(brief);
+  return briefs;
+}
+
+function gitOut(root, args) {
+  try {
+    return execFileSync("git", args, { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: 1 << 28 });
+  } catch {
+    return null;
+  }
+}
+
+/** Merge base of HEAD with the main branch (`DRWIL_BASE`, `origin/HEAD`, `origin/master`, `origin/main`, `master`, `main`), or null. */
+function mainBase(root, env) {
+  const candidates = env.DRWIL_BASE ? [env.DRWIL_BASE] : [];
+  const origin = gitOut(root, ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]);
+  if (origin) candidates.push(origin.trim());
+  candidates.push("origin/master", "origin/main", "master", "main");
+  for (const ref of candidates) {
+    if (gitOut(root, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]) === null) continue;
+    const base = gitOut(root, ["merge-base", "HEAD", ref]);
+    if (base) return base.trim();
+  }
+  return null;
+}
+
+/**
+ * Files already delivered: tracked on the main branch (its merge base with HEAD) and identical in the working
+ * tree. A file new or different there is not delivered and stays subject to a brief; without a readable main
+ * branch the set is empty, never a success by default (QUA-013).
+ */
+export function deliveredFiles(root, env = process.env) {
+  const base = mainBase(root, env);
+  if (!base) return new Set();
+  const tree = gitOut(root, ["ls-tree", "-r", "--name-only", "-z", base]);
+  const changed = gitOut(root, ["diff", "--name-only", "-z", "--no-renames", base]);
+  if ([tree, changed].includes(null)) return new Set();
+  const different = new Set(changed.split("\0").filter(Boolean));
+  return new Set(tree.split("\0").filter((f) => f && !different.has(f)));
+}
+
+/**
+ * `[brief, text]` of the briefs the branch deleted since its merge base with the main branch (the closing deletes the
+ * brief in the PR's own commit), at their last version; unreadable history: empty, never a success (QUA-013).
+ */
+export function closedBriefTexts(root, cfg = {}, env = process.env) {
+  const base = mainBase(root, env);
+  const dir = cfg?.dirs?.projects ?? "docs/projects";
+  const log = base && gitOut(root, ["log", "--no-renames", "--diff-filter=D", "--format=%H", "--name-only", `${base}..HEAD`, "--", dir]);
+  const [texts, seen] = [[], new Set()];
+  let commit = "";
+  for (const line of (log || "").split("\n").filter(Boolean)) {
+    if (/^[0-9a-f]{40}$/.test(line)) commit = line;
+    else if (line.endsWith(".md") && !seen.has(line) && seen.add(line)) texts.push([line, gitOut(root, ["show", `${commit}^:${line}`])]);
+  }
+  return texts;
+}
+
+/** Patterns of those closed briefs; their derived files (scope-derived.mjs) stay covered too, read by check-docs. */
+export const closedBriefPatterns = (root, cfg = {}, env = process.env) => patternsByBrief(closedBriefTexts(root, cfg, env), cfg);
+
+// Root of the project: this module lives in its `.githooks/` (QUA-044).
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+/**
+ * Code files of `paths` that no brief covers, sorted. A delivered file (`deliveredFiles`) or one listed by a brief
+ * the branch deleted (`closedBriefPatterns`) stays covered; a brief present at the same path wins (QUA-173). */
+export function outsideBriefs(paths, byBrief, cfg, delivered, closed) {
+  if (delivered === undefined) {
+    delivered = deliveredFiles(ROOT);
+    closed ??= closedBriefPatterns(ROOT, cfg);
+  }
+  // Recreated after its deletion (reinstall, QUA-116 reopening): the present version must not be overwritten.
+  const covering = new Map([...(closed ?? []), ...byBrief]);
+  const outside = (p) => isCode(p, cfg) && !delivered.has(p) && briefsCovering(p, covering).length === 0;
+  return [...new Set(paths.map(normalize).filter(outside))].sort();
+}

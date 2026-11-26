@@ -1,0 +1,49 @@
+{
+  "version": 2,
+  "ecarts": {
+    ".github/workflows/ia-first.yml": "Jobs vérifiés à part (clé ci) ; contenu différent : étapes propres au dépôt (npm ci et son cache, installation de gitleaks, vérification du ruleset) et alerte qui dépend aussi de kit-tests.",
+    ".gitignore": "Entrées propres au dépôt (rapport de couverture, documents internes, évidences).",
+    "AGENTS.md": "Consignes propres à chaque projet (le gabarit n'en est que la base), en français ; même aiguillage de 100 lignes au plus, le détail des règles est dans docs/ia-first.md, section 8.",
+    "INSTALL.md": "Installation propre au dépôt drwil (clone, non publié sur npm).",
+    "README.md": "Présentation propre au dépôt drwil.",
+    "docs/architecture.md": "Carte propre au dépôt drwil (le gabarit livre le modèle à rendre).",
+    "docs/contracts-catalog.md": "Contenu propre au projet, semé par le gabarit puis rempli par le dépôt, en français : catalogue:QUA-004 et catalogue:QUA-001 adoptés par ce dépôt, donc retirés de son catalogue.",
+    "docs/contracts.md": "Contenu propre au projet, semé par le gabarit puis rempli par le dépôt, en français : registre des contrats de drwil.",
+    "docs/features.md": "Contenu propre au projet, semé par le gabarit puis rempli par le dépôt, en français : fonctionnalités de drwil, examinées avant chaque release.",
+    "docs/intentions/README.md": "Table des fiches remplacée par un renvoi à l'index des chantiers (une information, une seule source).",
+    "docs/projects/journal.md": "Contenu propre au projet, semé par le gabarit puis rempli par le dépôt, en français : chantiers clôturés de drwil.",
+    "docs/projects/kit-mechanics.md": "Le cadrage du dépôt couvre en plus ses fichiers non livrés (tests des hooks, outils, modules optionnels installés) ; en français.",
+    "docs/projects/model-brief.md": "Modèle des fiches de ce dépôt, en français comme elles ; renvoie à DRWIL-012.",
+    "docs/projects/pending.md": "Contenu propre au projet, semé par le gabarit puis rempli par le dépôt, en français : index des chantiers de drwil.",
+    "docs/projects/routine-maintenance.md": "Contenu propre au projet, semé par le gabarit puis rempli par le dépôt, en français : entrées d'entretien de drwil.",
+    "docs/recipes/create-a-release.md": "Adaptée au dépôt : le module de release y est déjà activé, et le paquet empaqueté est packages/drwil.",
+    "docs/recipes/working-with-branches.md": "Deux phrases propres au dépôt : ses checks sont aussi imposés côté forge (ruleset de master), et un fichier livré s'y modifie dans le gabarit puis s'installe (npm run installer-depot)."
+  },
+  "propresAuDepot": {
+    ".github/workflows/codeql.yml": "Analyse statique propre au dépôt drwil (docs/projects/analyse-statique-ci.md) ; le livrable n'en reçoit pas.",
+    ".github/workflows/banc.yml": "Mini-banc de ce dépôt, à la demande (QUA-105) : il mesure le livrable, il n'en fait pas partie (QUA-018).",
+    ".githooks/*.test.mjs": "Tests des hooks : éprouvent drwil ici, non livrés (principe « livrable léger, dépôt éprouvé », 2026-10-11).",
+    ".github/CODEOWNERS": "Forge de ce dépôt (journal du 2026-10-13, « Protéger master ») ; le livrable : docs/intentions/forge-dans-le-livrable.md.",
+    ".github/ruleset-master.json": "Forge de ce dépôt (journal du 2026-10-13, « Protéger master ») ; le livrable : docs/intentions/forge-dans-le-livrable.md.",
+    ".github/scripts/verifier-ruleset.mjs": "Forge de ce dépôt (journal du 2026-10-13, « Protéger master ») ; le livrable : docs/intentions/forge-dans-le-livrable.md.",
+    ".github/scripts/ci-multi-os.mjs": "Matrice multi-OS de la CI de ce dépôt (docs/projects/ci-matrice-sur-pr.md, QUA-045) ; le workflow livré n'a pas de matrice.",
+    ".github/scripts/ci-multi-os.test.mjs": "Test de la matrice multi-OS de ce dépôt (QUA-045), non livré comme elle.",
+    ".github/scripts/workflows-yaml.test.mjs": "Test qui parse les fichiers de CI du dépôt et du gabarit (QUA-046) ; vérifie le gabarit ici, rien n'est livré.",
+    "docs/audit-risques.md": "Rapport généré pour ce dépôt par le skill d'audit (docs/recipes/audit-risks-and-debt.md).",
+    "docs/benchmark-protocole.md": "Protocole de mesure de drwil lui-même (bench avec et sans drwil).",
+    "docs/mesures-ci-reference.md": "Mesures historiques de la CI de drwil (preuve de QUA-122, chantier d'accélération du 2026-10-24) : propres au dépôt, non livrées.",
+    "docs/decouverte-valeur.md": "Rapport généré pour ce dépôt par le skill de découverte de valeur.",
+    "docs/intentions/": "Intentions de drwil : contenu du projet, pas du gabarit.",
+    "docs/projects/*": "Fiches des chantiers de drwil : contenu du projet, pas du gabarit.",
+    "docs/preuves/*.md": "Preuves de clôture des chantiers de drwil (QUA-084) : écrites par la clôture, propres au projet ; le gabarit ne livre que le README du dossier.",
+    "docs/recettes/": "Notes de recette des versions de drwil : contenu du projet, pas du gabarit."
+  },
+  "propresAuGabarit": {},
+  "ci": {
+    "fichier": ".github/workflows/ia-first.yml",
+    "jobsPropresAuDepot": {
+      "kit-tests": "Portabilité du paquet testée sur Linux, Windows et macOS (docs/projects/suites-kit-portable.md, point 1), selon la matrice de matrice-os.",
+      "matrice-os": "Calcule les OS de kit-tests selon l'événement et le code touché (docs/projects/ci-matrice-sur-pr.md, QUA-045)."
+    }
+  }
+}

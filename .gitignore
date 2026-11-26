@@ -1,0 +1,48 @@
+# Dépendances
+node_modules/
+
+# Produits de build (régénérés par `tsc --build`)
+dist/
+*.tsbuildinfo
+
+# Rapport de couverture c8 (régénéré par `npm run test:coverage`)
+packages/drwil/coverage/
+
+# Caches Python (contrôles de .githooks/ et scripts/)
+__pycache__/
+*.py[cod]
+
+# Journaux et fichiers temporaires
+*.log
+.DS_Store
+
+# Variables d'environnement (jamais de secret dans le dépôt)
+.env
+.env.*
+!.env.example
+
+# Tableau de bord généré (artefact dérivé, pas une source — voir
+# docs/recipes/view-progress.md)
+docs/dashboard.html
+DOC_TECHNICO_COMMERCIAL.md
+DOC_GOUVERNANCE_ET_USAGE.md
+
+# Évidences de `drwil verify --evidence` (une par exécution, locales) ; les attestations
+# humaines (`drwil attest`) restent versionnées : elles se relisent en PR.
+.drwil/evidence/*
+!.drwil/evidence/attestations/
+
+# État de gouvernance runtime (activité et attente actives de ce clone) : local,
+# jamais versionné — la reprise passe par la fiche versionnée (docs/ia-first.md).
+.drwil/state.json
+# Empreinte du dernier rappel court injecté à l'agent (`node .githooks/state.mjs reminder`) :
+# locale comme l'état, pour ne le réinjecter que s'il a changé.
+.drwil/reminder.json
+# Lots faits de la fiche en cours (`node .githooks/state.mjs lot next`) : local comme l'état.
+.drwil/lot.json
+# Identifiants déjà rappelés à l'agent dans sa session (.claude/hooks/id-glossary.mjs) : locale.
+.drwil/glossary.json
+
+# Réglages Claude Code personnels (plugins, exemptions) : jamais versionnés,
+# comme dans le gabarit.
+.claude/settings.local.json

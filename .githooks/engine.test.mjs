@@ -1,0 +1,1139 @@
+import { after, afterEach, beforeEach, test } from "node:test";
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { delimiter, dirname, join } from "node:path";
+import { checks, controlFingerprints, projectRoot, startParallel, texts, treeFingerprint } from "./engine.mjs";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { globToRegex } from "./glob.mjs";
+
+// Voir scope-gate.test.mjs : des GIT_* hérités feraient agir les tests sur le dépôt qui les lance.
+for (const nom of Object.keys(process.env)) if (nom.startsWith("GIT_")) delete process.env[nom];
+
+// Les dossiers gardés par un contrôle en échec (QUA-133) vont dans un temporaire propre à ce fichier, supprimé à la fin.
+const racineTemp = mkdtempSync(join(tmpdir(), "drwil-moteur-racine-"));
+process.env.TMPDIR = racineTemp;
+after(() => rmSync(racineTemp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
+let dossiers = [];
+afterEach(() => {
+  for (const d of dossiers) rmSync(d, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  dossiers = [];
+});
+const tmp = () => {
+  const dir = mkdtempSync(join(tmpdir(), "drwil-moteur-"));
+  dossiers.push(dir);
+  return dir;
+};
+function ecrire(racine, chemin, contenu) {
+  mkdirSync(dirname(join(racine, chemin)), { recursive: true });
+  writeFileSync(join(racine, chemin), contenu);
+}
+function git(racine, ...args) {
+  const r = spawnSync("git", args, { cwd: racine, encoding: "utf8" });
+  assert.equal(r.status, 0, `git ${args.join(" ")} : ${r.stderr}`);
+}
+function depot(branche = "travail") {
+  const racine = tmp();
+  git(racine, "init", "-q", "-b", branche);
+  return racine;
+}
+// Le pre-push exporte les références poussées : un test qui joue le moteur sans `env` les hériterait et se
+// croirait au push (runAt). Chaque test part d'un environnement sans elles.
+const VARIABLES_DE_PUSH = ["DRWIL_PUSH_REFS", "DRWIL_PUSH_TAGS_ONLY", "DRWIL_PUSH_NO_BRANCH"];
+let variablesDePush = {};
+beforeEach(() => {
+  variablesDePush = Object.fromEntries(VARIABLES_DE_PUSH.map((k) => [k, process.env[k]]));
+  for (const k of VARIABLES_DE_PUSH) delete process.env[k];
+});
+afterEach(() => {
+  for (const [k, v] of Object.entries(variablesDePush))
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+});
+const parId = (liste) => Object.fromEntries(liste.map((c) => [c.id, c]));
+// La durée (QUA-136) varie à chaque passe : les tests de verdict la retirent, le test de QUA-136 la juge.
+const sansDuree = ({ durationMs, ...r }) => r;
+const executer = (racine, id, options = {}, o = { stdio: "pipe" }) => sansDuree(parId(checks(racine, options))[id].run(o));
+
+/** Exécute `fn` avec PATH et HOME remplacés (gitleaks introuvable ou factice), puis les rétablit. */
+function avecEnv(valeurs, fn) {
+  const avant = { PATH: process.env.PATH, HOME: process.env.HOME };
+  Object.assign(process.env, valeurs);
+  try {
+    return fn();
+  } finally {
+    Object.assign(process.env, avant);
+  }
+}
+const dossierGit = dirname(
+  spawnSync(process.platform === "win32" ? "where" : "which", ["git"], { encoding: "utf8" }).stdout.split(/\r?\n/)[0],
+);
+/** gitleaks factice : note ses arguments et réussit. */
+function fauxGitleaks(dossier) {
+  const chemin = join(dossier, "gitleaks");
+  ecrire(dossier, "gitleaks", `#!/bin/sh\necho "$@" >> "${join(dossier, "appels")}"\nexit 0\n`);
+  chmodSync(chemin, 0o755);
+  return chemin;
+}
+const posix = { skip: process.platform === "win32" ? "gitleaks factice en script sh" : false };
+
+test("textes : anglais sur demande, français sinon", () => {
+  assert.equal(texts("en").noGit, "not a git repository");
+  assert.equal(texts("fr").noGit, "pas de dépôt git");
+  assert.equal(texts(undefined).noGit, "pas de dépôt git");
+});
+
+test("mode minimal : seuls les contrôles du socle hors mode sont applicables", () => {
+  const racine = depot();
+  const cfg = { mode: "minimal", ciFiles: ["ci.yml"] };
+  for (const id of ["secrets", "checks-self-test", "ci-coverage"]) {
+    assert.deepEqual(executer(racine, id, { cfg }), { status: "not-applicable", detail: "mode minimal" });
+  }
+});
+
+test("secrets : gitleaks absent du PATH comme de ~/.local/bin → non exécuté", () => {
+  const racine = depot();
+  const vide = tmp();
+  const r = avecEnv({ PATH: vide, HOME: vide }, () => executer(racine, "secrets", { cfg: { lang: "en" } }));
+  assert.deepEqual(r, { status: "not-run", detail: "gitleaks not installed" });
+});
+
+test("secrets : gitleaks trouvé hors dépôt git → non exécuté", posix, () => {
+  const outils = tmp();
+  fauxGitleaks(outils);
+  const r = avecEnv({ PATH: [outils, dossierGit].join(delimiter) }, () => executer(tmp(), "secrets"));
+  assert.deepEqual(r, { status: "not-run", detail: "pas de dépôt git", configured: true });
+});
+
+test("secrets : indexés seulement au commit, tout l'historique en CI ; ~/.local/bin aussi cherché", posix, () => {
+  const racine = depot();
+  const maison = tmp();
+  const outils = join(maison, ".local", "bin");
+  mkdirSync(outils, { recursive: true });
+  fauxGitleaks(outils);
+  avecEnv({ PATH: dossierGit, HOME: maison }, () => {
+    assert.equal(executer(racine, "secrets", { env: {} }).status, "ok");
+    assert.equal(executer(racine, "secrets", { env: { CI: "true" } }).status, "ok");
+  });
+  const appels = spawnSync("cat", [join(outils, "appels")], { encoding: "utf8" })
+    .stdout.trim()
+    .split("\n")
+    .filter((l) => l !== "version");
+  assert.match(appels[0], /--pre-commit --staged/);
+  assert.doesNotMatch(appels[1], /--staged/);
+});
+
+test("lancer : commande impossible à lancer = échec ; sortie capturée seulement en pipe", () => {
+  const racine = depot();
+  // Dossier de travail absent : le processus ne démarre même pas (r.error).
+  const cfg = { checks: [{ id: "x", run: "node -e 0", cwd: "absent" }] };
+  const r = parId(checks(racine, { cfg })).x.run({ stdio: "pipe" });
+  assert.equal(r.status, "fail");
+  assert.ok(r.detail);
+  // Sans options : stdio hérité, rien de capturé.
+  const ok = parId(checks(racine, { cfg: { checks: [{ run: "node -e 0" }] } }))["project:node -e 0"].run();
+  assert.deepEqual(sansDuree(ok), { status: "ok", output: undefined });
+});
+
+test("docs-references : lance check-docs du projet ; son échec remonte", () => {
+  const racine = depot();
+  ecrire(racine, ".githooks/check-docs.mjs", "process.exit(3)\n");
+  assert.equal(executer(racine, "docs-references").status, "fail");
+  ecrire(racine, ".githooks/check-docs.mjs", "console.log('vu')\n");
+  const annonces = [];
+  assert.deepEqual(executer(racine, "docs-references", {}, { stdio: "pipe", beforeRun: (n) => annonces.push(n) }), {
+    status: "ok",
+    output: "vu\n",
+  });
+  assert.deepEqual(annonces, ["chemins et contrats cités dans la doc"]);
+});
+
+test("QUA-040 : architecture-map lance check-architecture du projet ; son échec remonte", () => {
+  const racine = depot();
+  ecrire(racine, ".githooks/check-architecture.mjs", "process.exit(1)\n");
+  assert.equal(executer(racine, "architecture-map").status, "fail");
+  ecrire(racine, ".githooks/check-architecture.mjs", "console.log('carte')\n");
+  assert.deepEqual(executer(racine, "architecture-map"), { status: "ok", output: "carte\n" });
+  assert.match(texts("en").architecture, /QUA-040/);
+});
+
+test("QUA-029 : contract-tests lance check-contract-tests du projet ; son échec remonte", () => {
+  const racine = depot();
+  ecrire(racine, ".githooks/check-contract-tests.mjs", "process.exit(1)\n");
+  assert.equal(executer(racine, "contract-tests").status, "fail");
+  ecrire(racine, ".githooks/check-contract-tests.mjs", "console.log('lié')\n");
+  assert.deepEqual(executer(racine, "contract-tests"), { status: "ok", output: "lié\n" });
+  assert.match(texts("en").contractTests, /QUA-029/);
+});
+
+test("périmètre : bloquant = échec marqué ✗, avertissement = ok marqué ⚠ ; affiché hors pipe", () => {
+  const racine = depot();
+  const indexes = ["src/a.js"];
+  const annonces = [];
+  const bloque = executer(
+    racine,
+    "scope-gate",
+    { cfg: { scopeGate: "blocking" }, staged: indexes },
+    { stdio: "pipe", beforeRun: (n) => annonces.push(n) },
+  );
+  assert.equal(bloque.status, "fail");
+  assert.match(bloque.output, /^ {2}✗ /);
+  assert.deepEqual(annonces, ["périmètre de l'attente"]);
+  const journal = [];
+  const log = console.log;
+  console.log = (m) => journal.push(m);
+  try {
+    const averti = executer(racine, "scope-gate", { staged: indexes }, {});
+    assert.equal(averti.status, "ok");
+    assert.match(averti.output, /^ {2}⚠ /);
+  } finally {
+    console.log = log;
+  }
+  assert.equal(journal.length, 1);
+  // Sans problème : rien d'affiché.
+  assert.equal(executer(racine, "scope-gate", { staged: ["docs/projects/a.md"] }, {}).output, "");
+});
+
+test("branche principale : refusée hors CI, tolérée pour un push sans branche, hors dépôt git", () => {
+  assert.equal(executer(depot("master"), "main-branch", { env: {} }).status, "fail");
+  assert.match(
+    executer(depot("main"), "main-branch", { env: {}, cfg: { lang: "en" } }).message,
+    /^direct work on the main branch \(main\)/,
+  );
+  assert.deepEqual(executer(depot("travail"), "main-branch", { env: {} }), { status: "ok" });
+  assert.deepEqual(executer(tmp(), "main-branch", { env: {} }), { status: "ok" });
+  const maitre = depot("master");
+  assert.equal(executer(maitre, "main-branch", { env: { CI: "1" } }).status, "not-applicable");
+  assert.equal(executer(maitre, "main-branch", { env: { DRWIL_PUSH_TAGS_ONLY: "1" } }).detail, "push de tags uniquement");
+  assert.equal(executer(maitre, "main-branch", { env: { DRWIL_PUSH_NO_BRANCH: "1" } }).status, "not-applicable");
+  // Au push, les références distantes poussées sont jugées, pas la branche courante.
+  assert.deepEqual(executer(maitre, "main-branch", { env: { DRWIL_PUSH_REFS: " refs/heads/recette/v1.0.0" } }), { status: "ok" });
+  const versMain = executer(depot("travail"), "main-branch", { env: { DRWIL_PUSH_REFS: "refs/heads/travail refs/heads/main" } });
+  assert.equal(versMain.status, "fail");
+  assert.match(versMain.message, /branche principale \(main\)/);
+  // Vide (lancement sans entrée standard) : retour à la branche courante.
+  assert.equal(executer(maitre, "main-branch", { env: { DRWIL_PUSH_REFS: "" } }).status, "fail");
+});
+
+test("branche principale : le tout premier envoi vers un distant sans aucune branche passe, une seule fois", () => {
+  const travail = depot("travail");
+  const distant = tmp();
+  git(distant, "init", "-q", "--bare");
+  const vers = (remote, refs = "refs/heads/master") =>
+    executer(travail, "main-branch", { env: { DRWIL_PUSH_REFS: refs, DRWIL_PUSH_REMOTE: remote } });
+  // Distant vide : exception unique.
+  assert.equal(vers(distant).status, "ok");
+  assert.equal(vers(distant, "refs/heads/travail refs/heads/main").status, "ok");
+  // Distant injoignable, ou nom de distant absent : pas d'exception (non lu = non prouvé).
+  assert.equal(vers(join(distant, "inexistant")).status, "fail");
+  assert.equal(executer(travail, "main-branch", { env: { DRWIL_PUSH_REFS: "refs/heads/master" } }).status, "fail");
+  // Dès que le distant a une branche, le refus redevient la règle.
+  git(travail, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x");
+  git(travail, "push", "-q", distant, "travail:refs/heads/travail");
+  const refuse = vers(distant);
+  assert.equal(refuse.status, "fail");
+  assert.match(refuse.message, /branche principale \(master\)/);
+  assert.equal(vers(distant, "refs/heads/travail").status, "ok");
+});
+
+test("autotest : sans dossier ou sans test non applicable ; sinon les tests du dépôt tournent (même sous node --test)", () => {
+  const racine = depot();
+  assert.equal(executer(racine, "checks-self-test").detail, "tests propres au dépôt drwil, non livrés");
+  ecrire(racine, ".githooks/a.mjs", "");
+  assert.equal(executer(racine, "checks-self-test").status, "not-applicable");
+  ecrire(racine, ".githooks/a.test.mjs", "import { test } from 'node:test';\ntest('échoue', () => { throw new Error('x'); });\n");
+  assert.equal(executer(racine, "checks-self-test").status, "fail");
+});
+
+test("autotest : avec le lanceur par fichier du dépôt, les tests passent par lui (une exécution par fichier et par passe)", () => {
+  const racine = depot();
+  ecrire(racine, ".githooks/a.test.mjs", "import { test } from 'node:test'; test('t', () => {});\n");
+  ecrire(racine, ".githooks/contract-tests.mjs", "console.log(process.argv.slice(2).join(' '));\nprocess.exitCode = 1;\n");
+  const r = executer(racine, "checks-self-test");
+  assert.equal(r.status, "fail");
+  assert.match(r.output, /--runner node --all .githooks.a\.test\.mjs/);
+});
+
+test("couverture CI : sans CI non exécuté, sinon check-control-coverage du projet", () => {
+  const racine = depot();
+  assert.equal(executer(racine, "ci-coverage").status, "not-run");
+  assert.equal(executer(racine, "ci-coverage", { cfg: { ciFiles: "pas une liste" } }).status, "not-run");
+  ecrire(racine, ".githooks/check-control-coverage.mjs", "");
+  assert.equal(executer(racine, "ci-coverage", { cfg: { ciFiles: ["ci.yml"] } }).status, "ok");
+});
+
+test("QUA-043 : sans CI, le détail de la couverture CI dit comment en déclarer une", () => {
+  const racine = depot();
+  const r = executer(racine, "ci-coverage");
+  assert.equal(r.status, "not-run");
+  assert.match(r.detail, /npx drwil init --ci github.*--ci gitlab/);
+});
+
+test("contrôles du projet : identifiant, name: nom, report au commit hors chemins, cwd", () => {
+  const racine = depot();
+  ecrire(racine, "sous/marque.js", "");
+  const cfg = {
+    checks: [
+      {
+        id: "nomme",
+        name: "Nommé",
+        run: "node -e \"process.exit(require('fs').existsSync('marque.js') ? 0 : 1)\"",
+        cwd: "sous",
+        paths: ["src/**"],
+      },
+      { run: "node -e 0", paths: [] },
+    ],
+  };
+  const sans = parId(checks(racine, { cfg }));
+  assert.equal(sans.nomme.name, "Nommé");
+  assert.equal(sans.nomme.run({ stdio: "pipe" }).status, "ok");
+  const reporte = parId(checks(racine, { cfg, staged: ["autre/a.json"] }));
+  assert.deepEqual(reporte.nomme.run(), {
+    status: "not-run",
+    detail: "aucun fichier indexé sous ses chemins : rejoué au push et en CI",
+  });
+  assert.equal(reporte["project:node -e 0"].run({ stdio: "pipe" }).status, "ok");
+  const touche = parId(checks(racine, { cfg, staged: ["src/x/y.js"] }));
+  assert.equal(touche.nomme.run({ stdio: "pipe" }).status, "ok");
+  // checks absent ou mal formé : seuls les contrôles du socle.
+  assert.equal(checks(racine, { cfg: { checks: {} } }).length, 8);
+  assert.equal(checks(racine).length, 8);
+});
+
+test("QUA-141 : un motif `!` des paths retire un fichier du report au commit et de l'empreinte du contrôle", () => {
+  const racine = depot();
+  ecrire(racine, "src/a.txt", "a\n");
+  ecrire(racine, "src/a.test.txt", "t\n");
+  git(racine, "add", "-A");
+  git(racine, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x");
+  const cfg = { checks: [{ id: "c", run: "node -e 0", paths: ["src/**", "!src/*.test.txt"] }] };
+  const report = parId(checks(racine, { cfg, staged: ["src/a.test.txt"] })).c.run();
+  assert.equal(report.status, "not-run", "seul un fichier exclu est indexé : reporté");
+  assert.equal(parId(checks(racine, { cfg, staged: ["src/a.txt"] })).c.run({ stdio: "pipe" }).status, "ok");
+  const empreinte = () => controlFingerprints(racine, checks(racine, { cfg })).get("c");
+  const base = empreinte();
+  ecrire(racine, "src/a.test.txt", "autre\n");
+  assert.equal(empreinte(), base, "un octet d'un fichier exclu ne change pas l'empreinte");
+  ecrire(racine, "src/a.txt", "autre\n");
+  assert.notEqual(empreinte(), base);
+});
+
+test("QUA-035 : commit de documentation seule : tests des contrôles et contrôles du projet non exécutés, signalés ; avec du code, rejoués", () => {
+  const racine = depot();
+  ecrire(racine, ".githooks/x.test.mjs", "import { test } from 'node:test'; test('t', () => {});\n");
+  const cfg = { checks: [{ id: "lint", run: "node -e 0" }] };
+  const doc = parId(checks(racine, { cfg, staged: ["docs/projects/fiche.md", "README.md"] }));
+  for (const id of ["checks-self-test", "lint"])
+    assert.deepEqual(
+      doc[id].run({ stdio: "pipe" }),
+      { status: "not-run", detail: "commit de documentation seule : rejoué au push et en CI" },
+      id,
+    );
+  assert.match(texts("en").docsOnly, /documentation-only commit/);
+  const code = parId(checks(racine, { cfg, staged: ["docs/projects/fiche.md", "src/a.js"] }));
+  assert.equal(code.lint.run({ stdio: "pipe" }).status, "ok");
+  assert.equal(code["checks-self-test"].run({ stdio: "pipe" }).status, "ok");
+  const pousse = parId(checks(racine, { cfg }));
+  assert.equal(pousse.lint.run({ stdio: "pipe" }).status, "ok", "au push et en CI (rien d'indexé) : toujours rejoué");
+});
+
+test("projectRoot : dossier parent de .githooks/ quel que soit le dossier courant ; DRWIL_ROOT la remplace", () => {
+  const url = pathToFileURL(join(tmpdir(), "projet", ".githooks", "run-checks.mjs")).href;
+  assert.equal(projectRoot(url, {}), join(tmpdir(), "projet"));
+  assert.equal(projectRoot(url, { DRWIL_ROOT: "/ailleurs" }), "/ailleurs");
+  const avant = process.env.DRWIL_ROOT;
+  delete process.env.DRWIL_ROOT;
+  try {
+    assert.equal(projectRoot(url), join(tmpdir(), "projet"));
+  } finally {
+    if (avant !== undefined) process.env.DRWIL_ROOT = avant;
+  }
+});
+
+// Un worktree, `git commit -a` : le hook reçoit GIT_DIR, GIT_INDEX_FILE… Un contrôle lancé qui fait
+// `git init` ailleurs les hériterait et agirait sur le dépôt qui le lance, quel que soit le fichier de test.
+test("QUA-057 : le lanceur retire les GIT_* de l'environnement de chaque contrôle qu'il lance", () => {
+  const racine = depot();
+  const herite = "Object.keys(process.env).some((k) => k.startsWith('GIT_'))";
+  ecrire(racine, ".githooks/check-docs.mjs", `process.exit(${herite} ? 1 : 0);\n`);
+  ecrire(racine, ".githooks/check-control-coverage.mjs", `process.exit(${herite} ? 1 : 0);\n`);
+  ecrire(
+    racine,
+    ".githooks/a.test.mjs",
+    `import { test } from 'node:test';\ntest('sans GIT_*', () => { if (${herite}) throw new Error('GIT_* hérité'); });\n`,
+  );
+  const env = {
+    ...process.env,
+    GIT_DIR: join(racine, ".git"),
+    GIT_INDEX_FILE: join(racine, ".git", "index-du-hook"),
+    GIT_WORK_TREE: racine,
+  };
+  const cfg = { ciFiles: ["ci.yml"], checks: [{ id: "projet", run: `node -e "process.exit(${herite} ? 1 : 0)"` }] };
+  for (const id of ["docs-references", "checks-self-test", "ci-coverage", "projet"]) {
+    assert.equal(executer(racine, id, { cfg, env }).status, "ok", id);
+  }
+});
+
+// L'analyse des secrets indexés lit l'index du commit en cours : sous `git commit -a`, c'est
+// GIT_INDEX_FILE qui le désigne, pas .git/index.
+test("QUA-057 : seul gitleaks garde les GIT_* du hook, pour lire l'index du commit en cours", posix, () => {
+  const racine = depot();
+  const outils = tmp();
+  const chemin = join(outils, "gitleaks");
+  ecrire(outils, "gitleaks", `#!/bin/sh\necho "$GIT_INDEX_FILE" >> "${join(outils, "appels")}"\nexit 0\n`);
+  chmodSync(chemin, 0o755);
+  avecEnv({ PATH: `${outils}${delimiter}${dossierGit}`, HOME: tmp() }, () => {
+    assert.equal(executer(racine, "secrets", { env: { PATH: process.env.PATH, GIT_INDEX_FILE: "index-du-hook" } }).status, "ok");
+  });
+  assert.match(readFileSync(join(outils, "appels"), "utf8"), /^index-du-hook$/m);
+});
+
+const compte = (racine) => readFileSync(join(racine, "builds"), "utf8").trim().split("\n").length;
+const cmdBuild = (sortie = 0) =>
+  `node -e "require('fs').appendFileSync('builds','x\\n');console.log('sortie du build');process.exit(${sortie})"`;
+
+test("QUA-120 : la compilation n'est faite qu'une fois par passage, par le premier contrôle qui en dépend", async () => {
+  const racine = depot();
+  const cfg = {
+    build: cmdBuild(),
+    parallel: true,
+    checks: [
+      { id: "a", run: "node -e 0", needsBuild: true },
+      { id: "b", run: "node -e 0", needsBuild: true },
+      { id: "c", run: "node -e 0" },
+    ],
+  };
+  const liste = parId(checks(racine, { cfg }));
+  assert.equal(liste.c.run({ stdio: "pipe" }).status, "ok");
+  assert.throws(() => readFileSync(join(racine, "builds")), "rien ne dépend du build : pas compilé");
+  assert.equal(liste.a.run({ stdio: "pipe" }).status, "ok");
+  assert.equal(liste.b.run({ stdio: "pipe" }).status, "ok");
+  assert.equal(compte(racine), 1);
+  assert.equal((await liste.b.runAsync()).status, "ok", "compilé en série, relu en parallèle");
+  assert.equal(compte(racine), 1);
+  const parallele = parId(checks(racine, { cfg, staged: ["README.md.txt"] }));
+  assert.equal((await parallele.a.runAsync()).status, "ok");
+  assert.equal(compte(racine), 2, "autre passage, autre compilation");
+  assert.equal((await parallele.b.runAsync()).status, "ok");
+  assert.equal(compte(racine), 2);
+});
+
+test("QUA-120 : une compilation en échec fait échouer chaque contrôle qui en dépend, nommé, sa sortie dite une fois", async () => {
+  const racine = depot();
+  const cfg = {
+    build: cmdBuild(1),
+    parallel: true,
+    checks: [
+      { id: "a", name: "Alpha", run: "node -e 0", needsBuild: true },
+      { id: "b", name: "Bravo", run: "node -e 0", needsBuild: true },
+      { id: "c", run: "node -e 0", needsBuild: true },
+    ],
+  };
+  const liste = parId(checks(racine, { cfg }));
+  const a = liste.a.run({ stdio: "pipe" });
+  assert.equal(a.status, "fail");
+  assert.equal(a.message, "Alpha : la compilation du projet (build) est en échec");
+  assert.match(a.output, /sortie du build/);
+  const b = liste.b.run({ stdio: "pipe" });
+  assert.deepEqual([b.status, b.message, b.output], ["fail", "Bravo : la compilation du projet (build) est en échec", undefined]);
+  const asynchrone = parId(checks(racine, { cfg }));
+  const [x, y] = await Promise.all([asynchrone.a.runAsync(), asynchrone.c.runAsync()]);
+  assert.deepEqual([x.status, y.status], ["fail", "fail"]);
+  assert.equal([x, y].filter((r) => r.output !== undefined).length, 1, "sortie du build dite une fois");
+  assert.equal(compte(racine), 2);
+  const sans = parId(
+    checks(racine, { cfg: { lang: "en", parallel: true, checks: [{ id: "a", name: "Alpha", run: "node -e 0", needsBuild: true }] } }),
+  );
+  const manque = 'Alpha declares needsBuild without a "build" in .drwil/ia-first.json';
+  assert.equal(sans.a.run({ stdio: "pipe" }).message, manque);
+  assert.equal((await sans.a.runAsync()).message, manque);
+  const fr = parId(checks(racine, { cfg: { checks: [{ id: "a", name: "Alpha", run: "node -e 0", needsBuild: true }] } }));
+  assert.match(fr.a.run({ stdio: "pipe" }).message, /^Alpha déclare needsBuild sans « build »/);
+  const en = parId(
+    checks(racine, { cfg: { lang: "en", build: cmdBuild(1), checks: [{ id: "a", name: "Alpha", run: "node -e 0", needsBuild: true }] } }),
+  );
+  assert.equal(en.a.run({ stdio: "pipe" }).message, "Alpha: the project build failed");
+});
+
+test("QUA-120 : un contrôle reporté (hors chemins, doc seule) ne déclenche pas la compilation", async () => {
+  const racine = depot();
+  const cfg = { build: cmdBuild(), parallel: true, checks: [{ id: "a", run: "node -e 0", needsBuild: true, paths: ["src/**"] }] };
+  const liste = parId(checks(racine, { cfg, staged: ["autre/a.json"] }));
+  assert.equal(liste.a.run().status, "not-run");
+  assert.equal((await liste.a.runAsync()).status, "not-run");
+  assert.throws(() => readFileSync(join(racine, "builds")));
+});
+
+test("QUA-119 : en parallèle, mêmes verdicts qu'en série, un échec nomme son contrôle, un contrôle non lancé reste non exécuté", async () => {
+  const racine = depot();
+  ecrire(racine, ".githooks/a.test.mjs", "import { test } from 'node:test';\ntest('échoue', () => { throw new Error('x'); });\n");
+  const cfg = {
+    parallel: true,
+    checks: [
+      { id: "bon", run: "node -e \"console.log('bonjour')\"" },
+      { id: "mauvais", name: "Mauvais", run: 'node -e "process.exit(3)"' },
+      { id: "seul", run: "node -e 0", parallel: false },
+      { id: "inexistant", run: "node -e 0", cwd: "absent" },
+    ],
+  };
+  const liste = parId(checks(racine, { cfg }));
+  assert.equal(liste.seul.runAsync, undefined, "opt-out");
+  assert.equal(
+    checks(racine, { cfg: { checks: cfg.checks } }).some((c) => c.runAsync),
+    false,
+    "sans parallel, tout reste en série",
+  );
+  const lancee = startParallel(Object.values(liste), 2);
+  assert.deepEqual([...lancee.keys()].sort(), ["bon", "checks-self-test", "inexistant", "mauvais"].sort());
+  const bon = await lancee.get("bon");
+  assert.deepEqual([bon.status, bon.launched, bon.output.trim()], ["ok", true, "bonjour"]);
+  assert.equal((await lancee.get("mauvais")).status, "fail");
+  assert.equal((await lancee.get("inexistant")).status, "fail", "ne pas pouvoir lancer est un échec");
+  assert.equal((await lancee.get("checks-self-test")).status, "fail");
+  assert.equal(liste.mauvais.run({ stdio: "pipe" }).status, "fail");
+});
+
+test("QUA-119 : l'autotest en parallèle suit les mêmes cas qu'en série ; sans limite, au plus la moitié des cœurs", async () => {
+  const racine = depot();
+  const liste = parId(checks(racine, { cfg: { parallel: true } }));
+  assert.equal((await liste["checks-self-test"].runAsync()).detail, "tests propres au dépôt drwil, non livrés");
+  ecrire(racine, ".githooks/a.test.mjs", "import { test } from 'node:test';\ntest('ok', () => {});\n");
+  const r = await liste["checks-self-test"].runAsync();
+  assert.deepEqual([r.status, r.launched], ["ok", true]);
+  const vide = startParallel([{ id: "x", runAsync: async () => ({ status: "ok" }) }]);
+  assert.equal((await vide.get("x")).status, "ok");
+  assert.equal(startParallel([]).size, 0);
+});
+
+test("QUA-133 : chaque contrôle a un TMPDIR, TMP et TEMP propres, supprimés à la fin de la passe ; un contrôle en échec garde le sien, au même chemin", () => {
+  const racine = depot();
+  const base = tmp();
+  const ecrireTemp = `require("fs").writeFileSync(require("path").join(process.env.TMPDIR,"reste"),"x");if(process.env.TMP!==process.env.TMPDIR||process.env.TEMP!==process.env.TMPDIR)process.exit(2)`;
+  const lancerPasse = (echec) => {
+    const liste = checks(racine, {
+      cfg: {
+        checks: [
+          { name: "fuit", run: `node -e '${ecrireTemp}'` },
+          { name: "tombe", run: `node -e '${ecrireTemp};process.exit(${echec ? 1 : 0})'` },
+        ],
+      },
+      env: { ...process.env, TMPDIR: base },
+    });
+    const resultats = liste.filter((c) => c.id.startsWith("project:")).map((c) => c.run({ stdio: "pipe" }));
+    return { resultats, fin: liste.finish() };
+  };
+  const reussie = lancerPasse(false);
+  assert.deepEqual(
+    reussie.resultats.map((r) => r.status),
+    ["ok", "ok"],
+    "les variables valent le dossier du contrôle",
+  );
+  assert.deepEqual(readdirSync(base), [], "passe réussie : aucun dossier drwil-* laissé");
+  assert.equal(reussie.fin.kept, null);
+  assert.deepEqual(reussie.fin.leaks, [
+    { name: "fuit", count: 1 },
+    { name: "tombe", count: 1 },
+  ]);
+  assert.equal(reussie.resultats[0].leaked, 1);
+
+  const premiere = lancerPasse(true);
+  const gardes = readdirSync(base);
+  assert.equal(gardes.length, 1, "seul le dossier gardé reste");
+  assert.equal(premiere.fin.kept, join(base, gardes[0]));
+  assert.equal(readdirSync(premiere.fin.kept).length, 1, "le contrôle en échec seul est gardé");
+  const seconde = lancerPasse(true);
+  assert.equal(seconde.fin.kept, premiere.fin.kept, "même chemin d'une passe à l'autre");
+  assert.equal(readdirSync(base).length, 1, "remplacé, jamais accumulé");
+});
+
+test("QUA-133 : sans dossier temporaire utilisable, le contrôle tourne avec celui dont il hérite ; une racine non supprimable est signalée, jamais fatale", {
+  skip: process.platform === "win32" || process.getuid?.() === 0,
+}, () => {
+  const racine = depot();
+  const absent = join(tmp(), "absent");
+  const sans = checks(racine, { cfg: { checks: [{ name: "p", run: "node -e 0" }] }, env: { ...process.env, TMPDIR: absent } });
+  assert.equal(sans.find((c) => c.id === "project:p").run({ stdio: "pipe" }).status, "ok");
+  assert.deepEqual(sans.finish(), { kept: null, leaks: [], cleanupFailed: false });
+
+  const efface = checks(racine, {
+    cfg: { checks: [{ name: "efface", run: `node -e 'require("fs").rmSync(process.env.TMPDIR, { recursive: true })'` }] },
+    env: { ...process.env, TMPDIR: tmp() },
+  });
+  assert.equal(
+    efface.find((c) => c.id === "project:efface").run({ stdio: "pipe" }).leaked,
+    undefined,
+    "un dossier disparu ne compte aucune fuite",
+  );
+  efface.finish();
+
+  const base = tmp();
+  const liste = checks(racine, {
+    cfg: { checks: [{ name: "p", run: `node -e 'require("fs").chmodSync(process.env.TMPDIR + "/..", 0o500)'` }] },
+    env: { ...process.env, TMPDIR: base },
+  });
+  const r = liste.find((c) => c.id === "project:p").run({ stdio: "pipe" });
+  assert.equal(r.status, "ok");
+  try {
+    assert.equal(liste.finish().cleanupFailed, true);
+  } finally {
+    chmodSync(join(base, readdirSync(base)[0]), 0o700);
+  }
+});
+
+test("QUA-136 : un contrôle exécuté a sa durée en millisecondes entières, en synchrone comme en parallèle ; un contrôle non exécuté n'en a pas", async () => {
+  const racine = depot();
+  const cfg = {
+    parallel: true,
+    checks: [
+      { id: "lent", run: `node -e "setTimeout(()=>{},150)"` },
+      { id: "casse", run: "node -e process.exit(1)" },
+      { id: "reporte", run: "node -e 0", paths: ["src/**"] },
+    ],
+  };
+  const liste = parId(checks(racine, { cfg, staged: ["README.md.txt"] }));
+  const lent = liste.lent.run({ stdio: "pipe" });
+  assert.ok(Number.isInteger(lent.durationMs) && lent.durationMs >= 100, `durée : ${lent.durationMs}`);
+  const casse = liste.casse.run({ stdio: "pipe" });
+  assert.equal(casse.status, "fail");
+  assert.ok(Number.isInteger(casse.durationMs), "un échec a aussi sa durée");
+  const reporte = liste.reporte.run({ stdio: "pipe" });
+  assert.equal(reporte.status, "not-run");
+  assert.ok(!("durationMs" in reporte), "non exécuté : durée absente, jamais 0");
+  const parallele = parId(checks(racine, { cfg, staged: ["README.md.txt"] }));
+  const asynchrone = await parallele.lent.runAsync();
+  assert.ok(Number.isInteger(asynchrone.durationMs) && asynchrone.durationMs >= 100, `durée : ${asynchrone.durationMs}`);
+  assert.ok(!("durationMs" in (await parallele.reporte.runAsync())), "non exécuté en parallèle : durée absente");
+});
+
+test("QUA-140 : l'empreinte de l'arbre est stable, et change d'un octet d'un fichier suivi, d'un fichier non suivi, de la branche, de la configuration ; sans commit, aucune", () => {
+  const racine = depot();
+  ecrire(racine, ".drwil/ia-first.json", "{}");
+  ecrire(racine, "a.txt", "a\n");
+  assert.equal(treeFingerprint(racine), null, "sans commit : rien de reprenable");
+  git(racine, "add", "-A");
+  git(racine, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x");
+  const base = treeFingerprint(racine);
+  assert.match(base, /^[0-9a-f]{64}$/);
+  assert.equal(treeFingerprint(racine), base);
+  ecrire(racine, ".gitignore", "ignore.txt\n");
+  const ignore = treeFingerprint(racine);
+  ecrire(racine, "ignore.txt", "x");
+  assert.equal(treeFingerprint(racine), ignore, "un fichier ignoré ne change pas l'empreinte");
+  const vues = new Set([base, ignore]);
+  for (const alteration of [
+    () => ecrire(racine, "a.txt", "b\n"),
+    () => ecrire(racine, "nouveau.txt", ""),
+    () => ecrire(racine, "nouveau.txt", "!"),
+    () => ecrire(racine, ".drwil/ia-first.json", '{ "lang": "en" }'),
+    () => git(racine, "checkout", "-q", "-b", "autre"),
+  ]) {
+    alteration();
+    vues.add(treeFingerprint(racine));
+  }
+  assert.equal(vues.size, 7, "chaque altération donne une empreinte jamais vue");
+  symlinkSync(racine, join(racine, "lien"), "junction");
+  assert.equal(treeFingerprint(racine), null, "un fichier non suivi illisible : aucune empreinte, rien n'est repris");
+});
+
+test("QUA-140 : un contrôle est reprenable sauf si le projet déclare reuse: false", () => {
+  const liste = parId(
+    checks(depot(), {
+      cfg: {
+        checks: [
+          { id: "reseau", run: "node -e 0", reuse: false },
+          { id: "local", run: "node -e 0" },
+          { name: "sans-id", run: "node -e 0", reuse: false },
+        ],
+      },
+    }),
+  );
+  assert.equal(liste.reseau.reuse, false);
+  assert.equal(liste["project:sans-id"].reuse, false);
+  assert.equal(liste.local.reuse, true);
+  assert.equal(liste["docs-references"].reuse, true);
+});
+
+test("QUA-141 : l'empreinte d'un contrôle est stable, change d'un octet d'un fichier de son paths, d'un fichier non suivi qu'il couvre ou de sa déclaration, pas d'un fichier hors paths ni ignoré", () => {
+  const racine = depot();
+  ecrire(racine, ".gitignore", "ignore.txt\n");
+  ecrire(racine, "src/a.txt", "a\n");
+  ecrire(racine, "hors.txt", "h\n");
+  git(racine, "add", "-A");
+  git(racine, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x");
+  const empreinte = (declaration = { id: "c", run: "node -e 0", paths: ["src/**"] }) =>
+    controlFingerprints(racine, checks(racine, { cfg: { checks: [declaration] } })).get("c");
+  const base = empreinte();
+  assert.match(base, /^[0-9a-f]{64}$/);
+  assert.equal(empreinte(), base, "stable");
+  ecrire(racine, "hors.txt", "autre\n");
+  ecrire(racine, "ignore.txt", "x");
+  ecrire(racine, ".drwil/evidence/run-checks.log", "x");
+  assert.equal(empreinte(), base, "hors paths, ignoré ou preuve de la passe : inchangée");
+  const vues = new Set([base]);
+  for (const alteration of [
+    () => ecrire(racine, "src/a.txt", "b\n"),
+    () => ecrire(racine, "src/nouveau.txt", ""),
+    () => ecrire(racine, "src/nouveau.txt", "!"),
+    () => rmSync(join(racine, "src/a.txt")),
+  ]) {
+    alteration();
+    vues.add(empreinte());
+  }
+  vues.add(empreinte({ id: "c", run: "node -e 1", paths: ["src/**"] }));
+  assert.equal(vues.size, 6, "chaque altération donne une empreinte jamais vue");
+  assert.ok(!vues.has(null));
+});
+
+test("QUA-141 : sans paths, avec reuse: false ou reuse: \"tree\", sans fichier sous ses paths ou sans git, un contrôle n'a pas d'empreinte propre", () => {
+  const racine = depot();
+  ecrire(racine, "src/a.txt", "a\n");
+  const cfg = {
+    checks: [
+      { id: "avec", run: "node -e 0", paths: ["src/**"] },
+      { id: "sans", run: "node -e 0" },
+      { id: "reseau", run: "node -e 0", paths: ["src/**"], reuse: false },
+      { id: "arbre", run: "node -e 0", paths: ["src/**"], reuse: "tree" },
+      { id: "vide", run: "node -e 0", paths: ["rien/**"] },
+    ],
+  };
+  const liste = checks(racine, { cfg });
+  const empreintes = controlFingerprints(racine, liste);
+  assert.match(empreintes.get("avec"), /^[0-9a-f]{64}$/, "même sans commit : les fichiers non suivis comptent");
+  for (const id of ["sans", "reseau", "arbre", "vide", "docs-references"]) assert.equal(empreintes.get(id), null, id);
+  assert.deepEqual(
+    liste.filter((c) => c.perControl).map((c) => c.id),
+    ["checks-self-test", "avec", "vide"],
+  );
+  assert.equal(parId(liste).arbre.reuse, true, 'reuse: "tree" reste repris sur l\'arbre entier (QUA-140)');
+  const horsGit = tmp();
+  assert.equal(controlFingerprints(horsGit, checks(horsGit, { cfg })).get("avec"), null, "sans dépôt git : rien n'est repris");
+  symlinkSync(".", join(racine, "src", "boucle"));
+  assert.equal(controlFingerprints(racine, liste).get("avec"), null, "un fichier qui ne se lit pas : rien n'est repris");
+});
+
+test("QUA-141 : un contrôle ajouté à .drwil/ia-first.json ne change pas l'empreinte des autres ; un réglage la change ; readsChecks et les tests des hooks gardent le fichier entier", () => {
+  const racine = depot();
+  ecrire(racine, ".githooks/a.test.mjs", "import { test } from 'node:test'; test('t', () => {});\n");
+  ecrire(racine, "src/a.txt", "a\n");
+  const base = {
+    lang: "fr",
+    checks: [
+      { id: "lit", run: "node -e 0", paths: [".drwil/ia-first.json", "src/**"] },
+      { id: "liste", run: "node -e 0", paths: [".drwil/ia-first.json"], readsChecks: true },
+    ],
+  };
+  const empreintes = (cfg) => {
+    ecrire(racine, ".drwil/ia-first.json", JSON.stringify(cfg, null, 2));
+    return controlFingerprints(racine, checks(racine, { cfg }));
+  };
+  const avant = empreintes(base);
+  for (const id of ["lit", "liste", "checks-self-test"]) assert.match(avant.get(id), /^[0-9a-f]{64}$/, id);
+  const ajoute = empreintes({ ...base, checks: [...base.checks, { id: "nouveau", run: "node -e 1", paths: ["src/**"] }] });
+  assert.equal(ajoute.get("lit"), avant.get("lit"), "un contrôle ajouté ne rejoue pas les autres");
+  assert.notEqual(ajoute.get("liste"), avant.get("liste"), "readsChecks : le fichier entier compte");
+  assert.notEqual(ajoute.get("checks-self-test"), avant.get("checks-self-test"), "les tests des hooks lisent toute la configuration");
+  const reecrit = empreintes(base);
+  assert.equal(reecrit.get("lit"), avant.get("lit"), "stable");
+  assert.notEqual(empreintes({ ...base, lang: "en" }).get("lit"), avant.get("lit"), "un réglage que le contrôle lit la change");
+  ecrire(racine, ".drwil/ia-first.json", "{ pas du json");
+  const illisible = controlFingerprints(racine, checks(racine, { cfg: base })).get("lit");
+  assert.match(illisible, /^[0-9a-f]{64}$/);
+  assert.notEqual(illisible, avant.get("lit"), "une configuration illisible compte octet par octet");
+});
+
+test("QUA-141 : au commit, une configuration indexée dont seuls les autres contrôles changent reporte le contrôle ; un réglage, sa déclaration ou readsChecks le jouent", () => {
+  const racine = depot();
+  const declare = (cfg) => {
+    ecrire(racine, ".drwil/ia-first.json", JSON.stringify(cfg, null, 2));
+    git(racine, "add", "-A");
+    return cfg;
+  };
+  const base = {
+    lang: "fr",
+    checks: [
+      { id: "lit", run: "node -e 0", paths: [".drwil/ia-first.json"] },
+      { id: "liste", run: "node -e 0", paths: [".drwil/ia-first.json"], readsChecks: true },
+    ],
+  };
+  const statut = (cfg, id) => parId(checks(racine, { cfg, staged: [".drwil/ia-first.json"] }))[id].run({ stdio: "pipe" }).status;
+  assert.equal(statut(declare(base), "lit"), "ok", "sans commit précédent : joué");
+  git(racine, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x");
+  const ajoute = declare({ ...base, checks: [...base.checks, { id: "nouveau", run: "node -e 1" }] });
+  assert.deepEqual(parId(checks(racine, { cfg: ajoute, staged: [".drwil/ia-first.json"] })).lit.run(), {
+    status: "not-run",
+    detail: "aucun fichier indexé sous ses chemins : rejoué au push et en CI",
+  });
+  assert.equal(statut(ajoute, "liste"), "ok", "readsChecks : joué");
+  assert.equal(statut(declare({ ...ajoute, lang: "en" }), "lit"), "ok", "réglage changé : joué");
+  const propre = { ...base, checks: [{ ...base.checks[0], name: "renommé" }, base.checks[1]] };
+  assert.equal(statut(declare(propre), "lit"), "ok", "sa déclaration changée : joué");
+});
+
+test("QUA-295 : checks-self-test a une empreinte propre — inchangée par une fiche de projet, changée par un fichier qu'il lit", () => {
+  const racine = depot();
+  ecrire(racine, ".githooks/a.test.mjs", "import { test } from 'node:test'; test('t', () => {});\n");
+  ecrire(racine, "docs/projects/fiche.md", "un\n");
+  ecrire(racine, "docs/intentions/idee.md", "un\n");
+  const empreinte = () => controlFingerprints(racine, checks(racine)).get("checks-self-test");
+  const avant = empreinte();
+  assert.match(avant, /^[0-9a-f]{64}$/);
+  assert.equal(checks(racine).find((c) => c.id === "checks-self-test").perControl, true);
+  ecrire(racine, "docs/projects/fiche.md", "deux\n");
+  ecrire(racine, "docs/intentions/idee.md", "deux\n");
+  assert.equal(empreinte(), avant, "une fiche de projet ou d'intention ne rejoue pas les tests des hooks");
+  for (const f of [
+    ".githooks/a.test.mjs",
+    "outils/b.mjs",
+    "package.json",
+    "package-lock.json",
+    ".drwil/ia-first.json",
+    "packages/drwil/c.js",
+    "docs/contracts.md",
+  ]) {
+    const base = empreinte();
+    ecrire(racine, f, `${f} change\n`);
+    assert.notEqual(empreinte(), base, `${f} rejoue les tests des hooks`);
+  }
+});
+
+test("QUA-292 : tests-qua-039 et tests-qua-047 — repris malgré une fiche ou une intention, jamais servis après un fichier qu'ils lisent", () => {
+  const config = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", ".drwil", "ia-first.json"), "utf8");
+  const cfg = JSON.parse(config);
+  const racine = depot();
+  ecrire(racine, ".drwil/ia-first.json", config);
+  ecrire(racine, "docs/projects/fiche.md", "un\n");
+  ecrire(racine, "docs/intentions/idee.md", "un\n");
+  const lus = {
+    "tests-qua-039": [".githooks/glossary.mjs", "packages/drwil/src/verdict.ts", ".githooks/contract-tests.mjs", "package.json"],
+    "tests-qua-047": [
+      "packages/drwil/src/render.ts",
+      "outils/installer-depot.mjs",
+      "docs/ia-first.md",
+      ".claude/settings.json",
+      "AGENTS.md",
+    ],
+  };
+  for (const [id, fichiers] of Object.entries(lus)) {
+    for (const f of fichiers) ecrire(racine, f, "un\n");
+    assert.equal(checks(racine, { cfg }).find((c) => c.id === id).perControl, true, `${id} peut être repris`);
+    const empreinte = () => controlFingerprints(racine, checks(racine, { cfg })).get(id);
+    const avant = empreinte();
+    assert.match(avant, /^[0-9a-f]{64}$/);
+    ecrire(racine, "docs/projects/fiche.md", `${id} deux\n`);
+    ecrire(racine, "docs/intentions/idee.md", `${id} deux\n`);
+    assert.equal(empreinte(), avant, `${id} : une fiche de projet ou d'intention ne le rejoue pas`);
+    for (const f of fichiers) {
+      const base = empreinte();
+      ecrire(racine, f, `${f} change\n`);
+      assert.notEqual(empreinte(), base, `${id} : ${f} le rejoue`);
+    }
+  }
+});
+
+test("QUA-293 : miroirs-gabarit — repris malgré un autre test d'outil ou le code du paquet, jamais servi après un fichier qu'il compare ou lance", () => {
+  const config = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", ".drwil", "ia-first.json"), "utf8");
+  const cfg = JSON.parse(config);
+  const declare = cfg.checks.find((c) => c.id === "miroirs-gabarit");
+  assert.doesNotMatch(declare.run, /banc|\*\.test/, "ne relance pas tous les tests des outils");
+  const racine = depot();
+  ecrire(racine, ".drwil/ia-first.json", config);
+  assert.equal(checks(racine, { cfg }).find((c) => c.id === "miroirs-gabarit").perControl, true);
+  const empreinte = () => controlFingerprints(racine, checks(racine, { cfg })).get("miroirs-gabarit");
+  const lus = [
+    "outils/verifier-miroirs.mjs",
+    "outils/verifier-miroirs-lib.mjs",
+    "outils/verifier-miroirs.test.mjs",
+    "outils/miroirs.json",
+    "packages/drwil/templates/common/base/docs/recipes/x.md",
+    ".githooks/engine.mjs",
+    ".github/workflows/ia-first.yml",
+    "AGENTS.md",
+    ".gitignore",
+  ];
+  for (const f of [...lus, "outils/banc.test.mjs", "packages/drwil/src/verdict.ts"]) ecrire(racine, f, "un\n");
+  const avant = empreinte();
+  assert.match(avant, /^[0-9a-f]{64}$/);
+  for (const f of ["outils/banc.test.mjs", "packages/drwil/src/verdict.ts"]) {
+    ecrire(racine, f, `${f} change\n`);
+    assert.equal(empreinte(), avant, `${f} ne le rejoue pas`);
+  }
+  for (const f of lus) {
+    const base = empreinte();
+    ecrire(racine, f, `${f} change\n`);
+    assert.notEqual(empreinte(), base, `${f} le rejoue`);
+  }
+});
+
+test("QUA-294 : un contrôle repris sur ses seuls paths les déclare tous — chaque script cité par sa commande est sous ses paths", () => {
+  const cfg = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", ".drwil", "ia-first.json"), "utf8"));
+  const oublis = [];
+  for (const c of cfg.checks) {
+    if (!Array.isArray(c.paths) || c.reuse === false || c.reuse === "tree") continue;
+    const motifs = c.paths.map(globToRegex);
+    for (const f of c.run.match(/[\w./-]+\.(?:mjs|cjs|js|ts|sh)\b/g) ?? [])
+      if (!motifs.some((m) => m.test(f))) oublis.push(`${c.id} : ${f}`);
+  }
+  assert.deepEqual(
+    oublis,
+    [],
+    'un fichier lu hors de paths ferait reprendre un verdict périmé : l\'ajouter aux paths, ou déclarer reuse: "tree"',
+  );
+});
+
+// Contrôle réservé par `runAt` : lent, il ne tourne qu'au verify et en CI (QUA-208 à QUA-210).
+// Un env réduit garde le PATH hérité : la commande `node -e 0` du contrôle ne se résout que par lui (node n'est pas toujours dans /usr/bin : fnm).
+const avecPath = (env) => ({ PATH: process.env.PATH, ...env });
+const reserve = (runAt, extra = {}) => ({ checks: [{ id: "lent", run: "node -e 0", ...extra, ...(runAt ? { runAt } : {}) }] });
+
+test("QUA-208 : un contrôle réservé par runAt n'est pas joué au commit ni au push et le dit : non exécuté, jamais passé", () => {
+  const racine = depot();
+  const cfg = reserve(["verify", "ci"], { paths: ["src/**"] });
+  // Au commit, même avec un fichier sous ses paths.
+  const commit = parId(checks(racine, { cfg, staged: ["src/a.js"] })).lent.run({ stdio: "pipe" });
+  assert.deepEqual(commit, {
+    status: "not-run",
+    detail: "réservé par runAt (verify, ci) : pas joué au commit, rejoué par verify et en CI",
+    configured: true,
+  });
+  // Au push (références données par le pre-push, tags seuls et suppressions compris), hors CI.
+  for (const k of ["DRWIL_PUSH_REFS", "DRWIL_PUSH_TAGS_ONLY", "DRWIL_PUSH_NO_BRANCH"]) {
+    const r = parId(checks(racine, { cfg, env: avecPath({ [k]: "1" }) })).lent.run({ stdio: "pipe" });
+    assert.equal(r.status, "not-run", k);
+    assert.match(r.detail, /pas joué au push/, k);
+  }
+  // Le contrôle qui déclare `commit` ou `push` y tourne.
+  const auCommit = reserve(["commit", "verify", "ci"]);
+  assert.equal(parId(checks(racine, { cfg: auCommit, staged: ["src/a.js"] })).lent.run({ stdio: "pipe" }).status, "ok");
+  const auPush = reserve(["push", "verify", "ci"]);
+  assert.equal(parId(checks(racine, { cfg: auPush, env: avecPath({ DRWIL_PUSH_REFS: "x" }) })).lent.run({ stdio: "pipe" }).status, "ok");
+  assert.equal(parId(checks(racine, { cfg: auPush, staged: ["a.js"] })).lent.run({ stdio: "pipe" }).status, "not-run");
+  // En anglais.
+  const en = parId(checks(racine, { cfg: { ...cfg, lang: "en" }, staged: ["src/a.js"] })).lent.run({ stdio: "pipe" });
+  assert.match(en.detail, /not played at commit/);
+});
+
+// Contrôle confié à la CI (`runAt: ["ci"]`) : la CI de la PR ou MR seule le joue (QUA-208), l'option locale aussi (QUA-261).
+const github = [".github/workflows/ia-first.yml"];
+const confie = (ciFiles = github, extra = {}) => ({ ...reserve(["ci"], extra), ciFiles });
+
+test('QUA-208 : un contrôle confié à la CI (runAt ["ci"]) ne tourne ni au commit, ni au push, ni en verify : confié à la CI, jamais passé ; la CI le joue', () => {
+  const racine = depot();
+  const cfg = confie(github, { run: "node -e 'process.exit(1)'" });
+  const attendu = {
+    status: "not-run",
+    detail:
+      'confié à la CI (runAt ["ci"]) : pas joué ici, jamais compté passé ; joué par la CI de la PR ou MR, en local par --with-ci-checks',
+    configured: true,
+    ciPending: true,
+  };
+  for (const [cas, options] of [
+    ["commit", { staged: ["src/a.js"] }],
+    ["push", { env: avecPath({ DRWIL_PUSH_REFS: "x" }) }],
+    ["verify", { env: avecPath({}) }],
+  ]) {
+    assert.deepEqual(executer(racine, "lent", { cfg, ...options }), attendu, cas);
+    assert.equal(parId(checks(racine, { cfg, ...options })).lent.ciPending, true, `${cas} : annoncé en attente de la CI`);
+  }
+  // La CI le joue, même avec des références de push : son échec y bloque.
+  for (const env of [{ CI: "true" }, { CI: "true", DRWIL_PUSH_REFS: "x" }]) {
+    assert.equal(executer(racine, "lent", { cfg, env: avecPath(env) }).status, "fail");
+    assert.equal(parId(checks(racine, { cfg, env: avecPath(env) })).lent.ciPending, undefined);
+  }
+  // GitLab est une forge suivie, comme GitHub.
+  assert.equal(executer(racine, "lent", { cfg: confie([".gitlab-ci.yml"]), env: avecPath({}) }).status, "not-run");
+  assert.equal(executer(racine, "lent", { cfg: confie(["ci/.gitlab-ci.yml"]), env: avecPath({ CI: "1" }) }).status, "ok");
+  // Le réglage reste un réglage parmi d'autres : sans runAt, rien n'est en attente de la CI.
+  assert.equal(parId(checks(racine, { cfg: reserve(null), env: avecPath({}) })).lent.ciPending, undefined);
+  // En anglais.
+  const en = executer(racine, "lent", { cfg: { ...cfg, lang: "en" }, env: avecPath({}) });
+  assert.match(en.detail, /^left to CI \(runAt \["ci"\]\): not played here, never counted as passed/);
+});
+
+test('QUA-208 : runAt ["ci"] est refusé avec la raison sans CI déclarée (ciFiles vide) ni CI GitHub ou GitLab, partout', () => {
+  const racine = depot();
+  for (const [cas, cfg, attendu] of [
+    ["ciFiles absent", reserve(["ci"]), /runAt \["ci"\] sans CI déclarée \(ciFiles vide\)/],
+    ["ciFiles vide", confie([]), /sans CI déclarée \(ciFiles vide\)/],
+    ["autre forge", confie(["Jenkinsfile"]), /sans CI GitHub \(\.github\/workflows\/\) ni GitLab \(\.gitlab-ci\.yml\) dans ciFiles/],
+  ])
+    for (const [contexte, options] of [
+      ["commit", { staged: ["a.js"] }],
+      ["verify", { env: avecPath({}) }],
+      ["CI", { env: avecPath({ CI: "true" }) }],
+    ]) {
+      const r = executer(racine, "lent", { cfg, ...options });
+      assert.equal(r.status, "fail", `${cas} (${contexte})`);
+      assert.match(r.message, /^node -e 0 : réglage runAt refusé/, cas);
+      assert.match(r.message, attendu, cas);
+    }
+  // Une liste qui mêle ci à une autre valeur sans verify reste refusée : seul ["ci"] s'ajoute aux réglages permis.
+  assert.match(executer(racine, "lent", { cfg: { ...reserve(["commit", "ci"]), ciFiles: github } }).message, /ou ci seul/);
+  // ["ci", "ci"] est encore « ci seul ».
+  assert.equal(executer(racine, "lent", { cfg: { ...reserve(["ci", "ci"]), ciFiles: github }, env: avecPath({}) }).status, "not-run");
+  const en = executer(racine, "lent", { cfg: { ...confie(["Jenkinsfile"]), lang: "en" }, env: avecPath({}) });
+  assert.match(en.message, /without a GitHub \(\.github\/workflows\/\) or GitLab \(\.gitlab-ci\.yml\) CI in ciFiles/);
+  assert.match(executer(racine, "lent", { cfg: { ...confie([]), lang: "en" } }).message, /without a declared CI \(empty ciFiles\)/);
+});
+
+test("QUA-261 : l'option locale (withCiChecks) joue aussi un contrôle confié à la CI, sans rien changer aux autres réglages", () => {
+  const racine = depot();
+  const options = { cfg: confie(github, { run: "node -e 'process.exit(1)'" }), env: avecPath({}), withCiChecks: true };
+  assert.equal(executer(racine, "lent", options).status, "fail", "joué en local, son échec remonte");
+  const entree = parId(checks(racine, options)).lent;
+  assert.equal(entree.ciPlayed, true, "le contrôle joué par l'option est signalé");
+  assert.equal(entree.ciPending, undefined, "il n'est plus en attente de la CI");
+  // Un contrôle réservé à verify et ci reste non exécuté au commit : l'option ne vise que les contrôles confiés à la CI.
+  const r = executer(racine, "lent", { cfg: reserve(["verify", "ci"]), staged: ["a.js"], withCiChecks: true });
+  assert.equal(r.status, "not-run");
+  assert.equal(parId(checks(racine, { cfg: reserve(["verify", "ci"]), env: avecPath({}), withCiChecks: true })).lent.ciPlayed, undefined);
+  // Un réglage refusé le reste avec l'option.
+  assert.equal(executer(racine, "lent", { cfg: confie([]), env: avecPath({}), withCiChecks: true }).status, "fail");
+  assert.equal(parId(checks(racine, { cfg: confie([]), env: avecPath({}), withCiChecks: true })).lent.ciPlayed, undefined);
+});
+
+test("QUA-209 : verify et la CI jouent le contrôle réservé, son échec bloque ; un runAt mal formé est refusé, jamais ignoré", () => {
+  const racine = depot();
+  const cfg = reserve(["verify", "ci"]);
+  for (const [cas, options] of [
+    ["verify (rien d'indexé, pas de push)", {}],
+    ["CI", { env: avecPath({ CI: "true" }) }],
+    ["CI, même avec des références de push", { env: avecPath({ CI: "true", DRWIL_PUSH_REFS: "x" }) }],
+  ])
+    assert.equal(executer(racine, "lent", { cfg, ...options }).status, "ok", cas);
+  const echec = reserve(["verify", "ci"], { run: "node -e 'process.exit(1)'" });
+  assert.equal(executer(racine, "lent", { cfg: echec }).status, "fail", "l'échec du contrôle réservé remonte");
+  assert.equal(parId(checks(racine, { cfg })).lent.reuse, true, "un contrôle réservé reste un contrôle repris comme un autre (QUA-141)");
+
+  for (const [cas, runAt, attendu] of [
+    ["chaîne au lieu d'une liste", "verify", /liste non vide/],
+    ["liste vide", [], /liste non vide/],
+    ["valeur inconnue", ["verify", "ci", "lot"], /valeur inconnue "lot"/],
+    ["sans ci", ["verify"], /verify et ci y figurent toujours/],
+    ["sans verify", ["commit", "ci"], /verify et ci y figurent toujours/],
+    ["seulement au commit", ["commit"], /verify et ci y figurent toujours/],
+  ])
+    for (const [contexte, options] of [
+      ["commit", { staged: ["a.js"] }],
+      ["verify", {}],
+    ]) {
+      const r = executer(racine, "lent", { cfg: reserve(runAt), ...options });
+      assert.equal(r.status, "fail", `${cas} (${contexte})`);
+      assert.match(r.message, attendu, cas);
+      assert.match(r.message, /^node -e 0 : réglage runAt refusé/);
+    }
+  const en = executer(racine, "lent", { cfg: { ...reserve("verify"), lang: "en" } });
+  assert.match(en.message, /runAt setting refused \(a non-empty list is expected/);
+  const enInconnu = executer(racine, "lent", { cfg: { ...reserve(["verify", "ci", "lot"]), lang: "en" } });
+  assert.match(enInconnu.message, /unknown value "lot", expected: commit, push, verify, ci/);
+});
+
+test("QUA-210 : un contrôle sans runAt se comporte comme avant : joué partout, report par paths inchangé, déclaration inchangée", () => {
+  const racine = depot();
+  const cfg = reserve(null, { paths: ["src/**"] });
+  for (const [contexte, options, statut] of [
+    ["commit sous ses paths", { staged: ["src/a.js"] }, "ok"],
+    ["commit hors ses paths", { staged: ["autre.js"] }, "not-run"],
+    ["push", { env: avecPath({ DRWIL_PUSH_REFS: "x" }) }, "ok"],
+    ["verify", {}, "ok"],
+    ["CI", { env: avecPath({ CI: "true" }) }, "ok"],
+  ])
+    assert.equal(executer(racine, "lent", { cfg, ...options }).status, statut, contexte);
+  assert.deepEqual(executer(racine, "lent", { cfg, staged: ["autre.js"] }), {
+    status: "not-run",
+    detail: "aucun fichier indexé sous ses chemins : rejoué au push et en CI",
+  });
+  assert.equal(
+    parId(checks(racine, { cfg })).lent.declaration,
+    JSON.stringify([cfg.checks[0], null]),
+    "aucun champ ajouté à la déclaration",
+  );
+});
+
+test("QUA-211 : runAt entre dans l'empreinte propre du contrôle (QUA-141) : le changer rejoue le contrôle", () => {
+  const racine = depot();
+  ecrire(racine, "src/a.js", "x");
+  const empreinte = (cfg) => controlFingerprints(racine, checks(racine, { cfg })).get("lent");
+  const sans = empreinte(reserve(null, { paths: ["src/**"] }));
+  const avec = empreinte(reserve(["verify", "ci"], { paths: ["src/**"] }));
+  const autre = empreinte(reserve(["push", "verify", "ci"], { paths: ["src/**"] }));
+  assert.match(avec, /^[0-9a-f]{64}$/, "un contrôle réservé a une empreinte propre");
+  assert.equal(
+    new Set([sans, avec, autre]).size,
+    3,
+    "réserver ou élargir un contrôle ne reprend pas un verdict pris sous un autre réglage",
+  );
+  assert.equal(avec, empreinte(reserve(["verify", "ci"], { paths: ["src/**"] })), "même réglage, même empreinte");
+});
+
+test("QUA-212 : les tests du moteur et du paquet ne dépendent pas des variables DRWIL_PUSH_* du pre-push", () => {
+  const racine = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const env = {
+    ...process.env,
+    DRWIL_PUSH_REFS: "refs/heads/x",
+    DRWIL_PUSH_REMOTE: "origin",
+    DRWIL_PUSH_TAGS_ONLY: "",
+    DRWIL_PUSH_NO_BRANCH: "",
+  };
+  // Hérité du lanceur de ce test, NODE_TEST_CONTEXT fait du `node --test` relancé un enfant qui saute ses fichiers
+  // et passe sans rien jouer.
+  delete env.NODE_TEST_CONTEXT;
+  const jouer = (fichiers, filtre) =>
+    spawnSync(process.execPath, ["--test", "--test-reporter=tap", filtre, ...fichiers], {
+      cwd: racine,
+      env,
+      encoding: "utf8",
+    });
+  // Le test lui-même est exclu, sinon il se relancerait sans fin ; par --test-skip-pattern, car un motif négatif de
+  // --test-name-pattern est vrai pour le fichier entier, qui joue alors tous ses tests, celui-ci compris.
+  const moteur = jouer([".githooks/engine.test.mjs"], "--test-skip-pattern=^QUA-212");
+  assert.equal(moteur.status, 0, `moteur posé comme au push :\n${moteur.stdout.slice(-1500)}`);
+  assert.ok(Number(/^# pass (\d+)/m.exec(moteur.stdout)?.[1] ?? 0) > 1, `aucun test du moteur joué :\n${moteur.stdout.slice(-1500)}`);
+  // Les tests du kit sont découpés par thème (QUA-315) : on joue chaque fichier qui en déclare un ouvert par QUA-2,
+  // et on exige que tous soient joués, sans quoi un fichier vidé ou renommé passerait à vide.
+  const dossier = join(racine, "packages", "drwil", "test");
+  const declares = readdirSync(dossier)
+    .filter((f) => /^kit-.+\.test\.mjs$/.test(f))
+    .map((f) => [`packages/drwil/test/${f}`, (readFileSync(join(dossier, f), "utf8").match(/^test\("QUA-2/gm) ?? []).length])
+    .filter(([, n]) => n > 0);
+  const attendus = declares.reduce((somme, [, n]) => somme + n, 0);
+  assert.ok(attendus > 0, "aucun test QUA-2xx déclaré dans les fichiers kit-*.test.mjs");
+  const paquet = jouer(
+    declares.map(([f]) => f),
+    "--test-name-pattern=^QUA-2",
+  );
+  assert.equal(paquet.status, 0, `paquet posé comme au push :\n${paquet.stdout.slice(-1500)}`);
+  const joues = Number(/^# pass (\d+)/m.exec(paquet.stdout)?.[1] ?? 0);
+  assert.equal(joues, attendus, `tests QUA-2xx joués du paquet :\n${paquet.stdout.slice(-1500)}`);
+});
+
+test("QUA-217 : les tests du moteur passent quand node n'est que dans un dossier propre au shell (fnm), jamais dans /usr/bin ni /usr/local/bin", {
+  skip: process.platform === "win32" && "liens symboliques non garantis sous Windows",
+}, () => {
+  const racine = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const bin = join(tmp(), "fnm-like", "bin");
+  mkdirSync(bin, { recursive: true });
+  symlinkSync(process.execPath, join(bin, "node"));
+  // git reste trouvable (les tests créent des dépôts), mais par son seul dossier système. Sous un hook, git met en tête du
+  // PATH son dossier interne (git-core), sans `which` ni le reste du système : on l'écarte pour le vrai dossier système.
+  const gitDir = process.env.PATH.split(delimiter).find(
+    (d) => d && !/git-core[\\/]?$/.test(d) && spawnSync(join(d, "git"), ["--version"]).status === 0,
+  );
+  assert.ok(gitDir, "git introuvable dans le PATH");
+  const env = { ...process.env, PATH: [bin, gitDir].join(delimiter) };
+  // Hérité, NODE_TEST_CONTEXT fait du `node --test` relancé un enfant qui saute ses fichiers et passe sans rien jouer.
+  delete env.NODE_TEST_CONTEXT;
+  // Le test lui-même et QUA-212 sont exclus, sinon ils se relanceraient sans fin ; par --test-skip-pattern, car un motif
+  // négatif de --test-name-pattern est vrai pour le fichier entier, qui joue alors tous ses tests.
+  const moteur = spawnSync(
+    process.execPath,
+    ["--test", "--test-reporter=tap", "--test-skip-pattern=^QUA-21[27]", ".githooks/engine.test.mjs"],
+    {
+      cwd: racine,
+      env,
+      encoding: "utf8",
+    },
+  );
+  assert.equal(moteur.status, 0, `moteur sans node système dans le PATH :\n${moteur.stdout.slice(-1500)}`);
+  assert.ok(Number(/^# pass (\d+)/m.exec(moteur.stdout)?.[1] ?? 0) > 1, `aucun test du moteur joué :\n${moteur.stdout.slice(-1500)}`);
+});

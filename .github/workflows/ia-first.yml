@@ -1,0 +1,397 @@
+name: ia-first
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  # Tranches des contrôles découpés (`shards: N` dans .drwil/ia-first.json) : le nombre vient du plan, jamais du YAML.
+  # Sauté comme checks sur le push d'une branche dont la PR ouverte porte déjà ces checks (voir matrice-os).
+  plan:
+    needs: matrice-os
+    if: needs.matrice-os.outputs.saute != 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+      precedent: ${{ steps.plan.outputs.previous }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      # Un plan illisible fait échouer ce job, donc checks : jamais « aucune tranche » par défaut (QUA-013).
+      # QUA-250 : le run précédent de cette PR est lu d'abord (ses verdicts lents, rejoués au moindre doute) : aucune tranche pour ce qu'il a réglé.
+      - name: Planifier les tranches des contrôles découpés
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node .githooks/run-checks.mjs --pr-previous >> "$GITHUB_OUTPUT"
+          matrix=$(node .githooks/run-checks.mjs --shard-plan)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "count=$(jq '.include | length' <<< "$matrix")" >> "$GITHUB_OUTPUT"
+  # Un job par tranche. Une PR joue la tranche avec les hooks de la branche principale (QUA-113), comme le rejeu de checks ;
+  # la tranche laisse son verdict (contrôle, empreinte, commit, indice, total, statut) en artefact, lu par l'agrégation.
+  shards:
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    name: shard ${{ matrix.index }}/${{ matrix.total }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Jouer la tranche
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          SLICE: ${{ matrix.index }}/${{ matrix.total }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            base="origin/$BASE_REF"
+            if git cat-file -e "$base:.githooks/base-checks.mjs" 2>/dev/null; then
+              git show "$base:.githooks/base-checks.mjs" > "$RUNNER_TEMP/base-checks.mjs"
+              node "$RUNNER_TEMP/base-checks.mjs" --base "$base" --shard "$SLICE"
+            else
+              node .githooks/base-checks.mjs --base "$base" --shard "$SLICE"
+            fi
+          else
+            node .githooks/run-checks.mjs --shard "$SLICE"
+          fi
+      # Même après un échec : une tranche en échec laisse son verdict « fail », une tranche sans verdict manque à l'agrégation.
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.index }}-of-${{ matrix.total }}
+          path: .drwil/evidence/shards
+          if-no-files-found: warn
+          overwrite: true
+  checks:
+    # Sauté sur le push d'une branche dont la PR ouverte porte déjà ces checks (voir matrice-os). Le job exigé garde son nom (QUA-251) et
+    # agrège les tranches : `always()`, un plan ou une tranche en échec, sautée ou annulée le fait échouer, jamais un succès par défaut (QUA-013).
+    needs: [matrice-os, plan, shards]
+    if: always() && needs.matrice-os.outputs.saute != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuser un plan ou une tranche qui n'a pas réussi
+        env:
+          PLAN: ${{ needs.plan.result }}
+          SHARDS: ${{ needs.shards.result }}
+          COUNT: ${{ needs.plan.outputs.count }}
+        run: |
+          [ "$PLAN" = success ] || { echo "::error::Le plan n'a pas réussi ($PLAN) : les tranches des contrôles découpés sont inconnues."; exit 1; }
+          if [ "$COUNT" != 0 ] && [ "$SHARDS" != success ]; then
+            echo "::error::Les tranches n'ont pas réussi ($SHARDS) : les contrôles découpés ne sont pas passés."
+            exit 1
+          fi
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      # Lot 3 de ci-plus-rapide : un push sur la branche principale dont l'arbre (`git rev-parse HEAD^{tree}`)
+      # est celui que la dernière CI verte d'une PR a joué ne rejoue pas les contrôles et le dit. La preuve est
+      # l'artefact `arbre-prouve` de cette CI de PR ; elle n'est lue que par ce push. Tout manque (aucune PR,
+      # CI non verte, artefact absent ou expiré, arbre différent : PR non à jour) rejoue tout. Le job reste
+      # rapporté « succès » sous son nom exigé : la CI de la branche principale reste verte pour QUA-251.
+      # QUA-296 : sauté, ce push sauvegarde quand même le cache de verdicts (clé : son sha), avec les verdicts que cette
+      # CI de PR a laissés dans la même preuve, posés seulement après la comparaison des arbres. Verdicts absents ou
+      # illisibles (preuve d'avant QUA-296, artefact expiré) : rien n'est sauvegardé, et c'est dit sans faire échouer la CI.
+      - name: Arbre déjà prouvé par la dernière CI verte d'une PR ?
+        id: prouve
+        if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPOT: ${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          saute=false
+          arbre=$(git rev-parse 'HEAD^{tree}')
+          for tete in $(gh api "repos/$DEPOT/commits/$COMMIT/pulls" --jq '.[].head.sha' 2>/dev/null); do
+            run=$(gh api "repos/$DEPOT/actions/runs?head_sha=$tete&event=pull_request&per_page=100" --jq '[.workflow_runs[] | select(.path | startswith(".github/workflows/ia-first.yml"))] | sort_by(.created_at) | last | select(.conclusion == "success") | .id' 2>/dev/null) || continue
+            [ -n "$run" ] || continue
+            rm -rf "$RUNNER_TEMP/preuve"
+            gh run download "$run" --repo "$DEPOT" --name arbre-prouve --dir "$RUNNER_TEMP/preuve" 2>/dev/null || continue
+            if [ "$(cat "$RUNNER_TEMP/preuve/arbre-prouve.txt" 2>/dev/null)" = "$arbre" ]; then
+              saute=true
+              echo "::notice::Contrôles non rejoués : l'arbre $arbre est celui que la CI verte de la PR (run $run) a prouvé."
+              if jq -e '.checks | type == "object"' "$RUNNER_TEMP/preuve/run-checks-verdicts.json" > /dev/null 2>&1; then
+                mkdir -p .drwil/evidence
+                cp "$RUNNER_TEMP/preuve/run-checks-verdicts.json" .drwil/evidence/run-checks-verdicts.json
+                echo "::notice::Verdicts de la CI de la PR (run $run) repris pour le cache de verdicts de $COMMIT."
+              else
+                echo "::warning::Aucun verdict lisible dans la preuve du run $run : le cache de verdicts n'est pas sauvegardé pour $COMMIT."
+              fi
+              break
+            fi
+          done
+          [ "$saute" = true ] || echo "Arbre non prouvé par une CI verte de PR : tout est rejoué."
+          echo "saute=$saute" >> "$GITHUB_OUTPUT"
+      # La plus ancienne version de Node prise en charge (engines : >= 22) joue ici toute la suite, une
+      # seule fois (couverture-tests, couverture-hooks…) : le job est exigé par la forge, une ligne de
+      # matrice en plus renommerait les checks exigés. Node 24 joue la suite du paquet dans kit-tests.
+      - if: steps.prouve.outputs.saute != 'true'
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - if: steps.prouve.outputs.saute != 'true'
+        run: npm ci
+      # Sans gitleaks, SEC-007 (pas de secret) serait « non exécuté » ici, et verify en ERROR dans le
+      # projet d'essai du contrôle tarball (journal « Gitleaks en CI », docs/projects/journal.md). Version épinglée, archive
+      # vérifiée par sa somme publiée ; installé là où le moteur le cherche (~/.local/bin).
+      # Le téléchargement ci-dessous se remet d'une erreur passagère (504 compris) : curl lit ~/.curlrc. L'étape
+      # d'installation reste identique à celle du banc (.github/workflows/banc.yml, QUA-109), qui la compare.
+      - name: Nouvelles tentatives de curl
+        if: steps.prouve.outputs.saute != 'true'
+        run: |
+          printf '%s\n' 'retry = 5' 'retry-all-errors' 'retry-delay = 5' 'connect-timeout = 20' 'max-time = 120' > ~/.curlrc
+      # Archive cachée sous la version épinglée (clé sans hash) : la somme est vérifiée à chaque passe, cache ou non.
+      - name: Restaurer l'archive gitleaks
+        if: steps.prouve.outputs.saute != 'true'
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/gitleaks.tar.gz
+          key: gitleaks-8.21.2-linux-x64
+      - name: Installer gitleaks 8.21.2
+        if: steps.prouve.outputs.saute != 'true'
+        run: |
+          cd "$RUNNER_TEMP"
+          [ -s gitleaks.tar.gz ] || curl -sSfL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 --max-time 120 -o gitleaks.tar.gz https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz
+          echo "5bc41815076e6ed6ef8fbecc9d9b75bcae31f39029ceb55da08086315316e3ba  gitleaks.tar.gz" | sha256sum -c -
+          mkdir -p ~/.local/bin && tar -xzf gitleaks.tar.gz -C ~/.local/bin gitleaks
+          ~/.local/bin/gitleaks version
+      # QUA-250 : sur une PR, les verdicts de la dernière CI de la branche principale sont restaurés et
+      # run-checks reprend chaque contrôle « ok » dont l'empreinte (fichiers et commande) est identique ;
+      # seul un push sur la branche principale les sauvegarde (rejoués, ou ceux de la PR qui a prouvé son arbre,
+      # QUA-296) : une PR ne relit jamais un verdict qu'elle aurait écrit. Sans cache restauré, tout est rejoué.
+      - name: Restaurer les verdicts de la CI de la branche principale
+        id: verdicts
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@v6
+        with:
+          path: .drwil/evidence/run-checks-verdicts.json
+          key: run-checks-verdicts-${{ github.event.pull_request.base.sha }}
+          restore-keys: run-checks-verdicts-
+      # QUA-297 : la clé réellement restaurée (le préfixe peut servir un cache ancien) et son retard sur la base de la
+      # PR, dits au journal ; jamais bloquant : un cache ancien ou absent ne coûte que du temps (contrôles rejoués).
+      - name: Âge du cache de verdicts restauré
+        if: github.event_name == 'pull_request'
+        env:
+          CLE: ${{ steps.verdicts.outputs.cache-matched-key }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          commit=${CLE##*-}
+          if [ -z "$CLE" ]; then
+            echo "::notice::cache de verdicts : aucun restauré (premier passage ou cache expiré) : tout est rejoué."
+          elif retard=$(git rev-list --count "$commit..$BASE" 2>/dev/null); then
+            echo "::notice::cache de verdicts : commit $commit, $retard commits de retard sur la base $BASE."
+          else
+            echo "::notice::cache de verdicts : commit $commit, retard inconnu (commit absent de l'historique de la base $BASE)."
+          fi
+      # QUA-250 : le run que le plan a lu (jamais un autre) ; les verdicts de cette passe sont ensuite gardés pour le push suivant de la PR.
+      - if: steps.prouve.outputs.saute != 'true' && needs.plan.outputs.precedent != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRECEDENT: ${{ needs.plan.outputs.precedent }}
+        run: node .githooks/run-checks.mjs --pr-previous "$PRECEDENT"
+      # Les contrôles découpés sont jugés sur les verdicts des tranches (`--aggregate-shards`) : toutes leurs tranches de ce commit « ok », aucune absente.
+      - name: Télécharger les verdicts des tranches
+        if: steps.prouve.outputs.saute != 'true' && needs.plan.outputs.count != '0'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*
+          merge-multiple: true
+          path: .drwil/evidence/shards
+      - if: steps.prouve.outputs.saute != 'true'
+        run: node .githooks/run-checks.mjs --aggregate-shards .drwil/evidence/shards
+        env:
+          DRWIL_CI_REUSE: ${{ github.event_name == 'pull_request' && '1' || '' }}
+      # QUA-296 : les verdicts de cette passe, mis de côté avant le rejeu avec les hooks de la branche principale (qui
+      # réécrit le fichier) ; joints à la preuve de l'arbre, ils ne sont lus que par le push de la fusion, jamais par une PR.
+      - name: Garder les verdicts de cette passe pour la fusion
+        if: github.event_name == 'pull_request' && hashFiles('.drwil/evidence/run-checks-verdicts.json') != ''
+        run: mkdir -p "$RUNNER_TEMP/arbre-prouve" && cp .drwil/evidence/run-checks-verdicts.json "$RUNNER_TEMP/arbre-prouve/"
+      - name: Sauvegarder les verdicts de la branche principale
+        if: always() && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && hashFiles('.drwil/evidence/run-checks-verdicts.json') != ''
+        uses: actions/cache/save@v6
+        with:
+          path: .drwil/evidence/run-checks-verdicts.json
+          key: run-checks-verdicts-${{ github.sha }}
+      # QUA-113: on a pull request, the checks are replayed with the main branch's hooks (its
+      # .githooks/, read through Git) and the PR's list of checks: a PR that weakens a hook or
+      # removes a check does not validate itself. The main branch's copy of base-checks.mjs runs;
+      # the PR's only while the main branch has none yet (kit adoption).
+      - name: Replay the checks with the main branch's hooks
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          base="origin/$BASE_REF"
+          if git cat-file -e "$base:.githooks/base-checks.mjs" 2>/dev/null; then
+            git show "$base:.githooks/base-checks.mjs" > "$RUNNER_TEMP/base-checks.mjs"
+            node "$RUNNER_TEMP/base-checks.mjs" --base "$base" --aggregate-shards .drwil/evidence/shards
+          else
+            node .githooks/base-checks.mjs --base "$base" --aggregate-shards .drwil/evidence/shards
+          fi
+      - if: github.event_name == 'pull_request' && always() && hashFiles('.drwil/evidence/pr-verdicts/pr-verdicts.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-verdicts
+          path: .drwil/evidence/pr-verdicts
+          retention-days: 14
+          overwrite: true
+      # La protection de master vit dans les réglages de GitHub : elle doit rester celle
+      # versionnée (.github/ruleset-master.json), sinon un changement passerait sans PR.
+      - run: node .github/scripts/verifier-ruleset.mjs
+        env:
+          GH_TOKEN: ${{ github.token }}
+      # Preuve lue par le push sur la branche principale (étape « Arbre déjà prouvé… ») : posée en dernier, donc
+      # seulement si chaque étape du job a réussi, avec l'arbre exact que cette CI a joué (et ses verdicts, QUA-296).
+      - name: Consigner l'arbre prouvé par cette CI
+        if: github.event_name == 'pull_request'
+        run: mkdir -p "$RUNNER_TEMP/arbre-prouve" && git rev-parse 'HEAD^{tree}' > "$RUNNER_TEMP/arbre-prouve/arbre-prouve.txt"
+      - if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: arbre-prouve
+          path: ${{ runner.temp }}/arbre-prouve
+      # Non-régression (journal « Capitaliser les tests de non-régression », docs/projects/journal.md) : sur une PR en échec, les mêmes
+      # contrôles sont rejoués sur la base de la PR pour dire si l'échec était déjà là. Le verdict ne
+      # change pas — le job reste en échec : un échec préexistant se corrige aussi, il ne s'excuse pas.
+      - name: Échec introduit par la PR ou déjà présent sur sa base ?
+        if: failure() && github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git worktree add ../base "$BASE"
+          cd ../base
+          if ! npm ci --silent; then
+            echo "::warning::Base $BASE non rejouée (installation impossible) : origine de l'échec inconnue, jamais présumée."
+          elif node .githooks/run-checks.mjs > ../base-checks.log 2>&1; then
+            echo "::error::Échec introduit par cette PR : la base ($BASE) passe les mêmes contrôles."
+          else
+            echo "::warning::Échec déjà présent sur la base de la PR ($BASE) : pas introduit par cette PR, à corriger quand même."
+            grep -F "✗" ../base-checks.log || true
+          fi
+      # drwil-project-begin steps
+      # drwil-project-end steps
+  # drwil-project-begin jobs
+  # OS de kit-tests (QUA-045) : Ubuntu seul teste sur une PR (aucun si elle ne touche que la
+  # documentation), Windows et macOS y sont rapportés sans tests ; un push de branche, master compris,
+  # ne rapporte qu'Ubuntu ; le push d'un tag de release et un lancement manuel testent les trois.
+  matrice-os:
+    runs-on: ubuntu-latest
+    outputs:
+      matrice: ${{ steps.calcul.outputs.matrice || steps.saute.outputs.matrice }}
+      saute: ${{ steps.pr.outputs.saute }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      # Un push sur une branche qui a déjà une PR ouverte rejouerait les mêmes jobs que la PR sur le
+      # même commit : `checks` et les tests de kit-tests sont sautés, la PR garde les siens. Sans PR
+      # (ou si GitHub ne répond pas), le push teste comme avant ; master et les tags ne sont jamais sautés.
+      - id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENEMENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          PRINCIPALE: ${{ github.event.repository.default_branch }}
+          BRANCHE: ${{ github.ref_name }}
+        run: |
+          saute=false
+          if [ "$EVENEMENT" = push ] && [[ "$REF" == refs/heads/* ]] && [ "$REF" != "refs/heads/$PRINCIPALE" ]; then
+            ouvertes=$(gh pr list --repo "${{ github.repository }}" --head "$BRANCHE" --state open --json number --jq length) || ouvertes=0
+            if [ "$ouvertes" != "0" ]; then saute=true; echo "::notice::Push sauté : la pull request ouverte de $BRANCHE porte déjà ces checks."; fi
+          fi
+          echo "saute=$saute" >> "$GITHUB_OUTPUT"
+      - id: saute
+        if: steps.pr.outputs.saute == 'true'
+        run: echo 'matrice=[{"os":"ubuntu-latest","tester":false,"raison":"ce push a une PR ouverte qui porte déjà ces checks."}]' >> "$GITHUB_OUTPUT"
+      - id: calcul
+        if: steps.pr.outputs.saute != 'true'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          TETE: ${{ github.event.pull_request.head.sha }}
+        run: node .github/scripts/ci-multi-os.mjs
+  # Portabilité du kit (QUA-045) : npm test de packages/drwil (pas la suite complète run-checks.mjs,
+  # qui dépend de gitleaks), sur les OS que matrice-os fait tester.
+  kit-tests:
+    needs: matrice-os
+    # Nom fixé : le ruleset de master exige « kit-tests (<os>) », or `include` ajouterait gitleaks et sha256 au nom.
+    name: kit-tests (${{ matrix.os }})
+    strategy:
+      matrix:
+        include: ${{ fromJSON(needs.matrice-os.outputs.matrice) }}
+    runs-on: ${{ matrix.os }}
+    # Pas de `if` de job : un job de matrice sauté n'est pas rapporté sous son nom et la PR attendrait
+    # un check exigé qui ne vient jamais. Sans tests, chaque étape est sautée, et le saut est dit.
+    steps:
+      - if: ${{ !matrix.tester }}
+        shell: bash
+        env:
+          OS: ${{ matrix.os }}
+          RAISON: ${{ matrix.raison }}
+        run: 'echo "::notice::$OS non testé : $RAISON"'
+      - if: ${{ matrix.tester }}
+        uses: actions/checkout@v7
+      - if: ${{ matrix.tester }}
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - if: ${{ matrix.tester }}
+        run: npm ci
+      # Les tests du paquet lancent run-checks dans des projets temporaires : sans gitleaks, le
+      # contrôle des secrets y est « non exécuté », donc en échec (QUA-013). Archive vérifiée par sha256.
+      - name: Restaurer l'archive gitleaks
+        if: ${{ matrix.tester }}
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/${{ matrix.gitleaks }}
+          key: gitleaks-8.21.2-${{ matrix.sha256 }}
+      - name: Installer gitleaks 8.21.2
+        if: ${{ matrix.tester }}
+        shell: bash
+        run: |
+          [ -s "$RUNNER_TEMP/${{ matrix.gitleaks }}" ] || curl -sSfL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 --max-time 120 -o "$RUNNER_TEMP/${{ matrix.gitleaks }}" "https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/${{ matrix.gitleaks }}"
+          cd "$RUNNER_TEMP"
+          if command -v sha256sum >/dev/null; then echo "${{ matrix.sha256 }}  ${{ matrix.gitleaks }}" | sha256sum -c -; else echo "${{ matrix.sha256 }}  ${{ matrix.gitleaks }}" | shasum -a 256 -c -; fi
+          mkdir -p "$RUNNER_TEMP/gitleaks-bin"
+          case "${{ matrix.gitleaks }}" in *.zip) unzip -q "${{ matrix.gitleaks }}" -d "$RUNNER_TEMP/gitleaks-bin" ;; *) tar -xzf "${{ matrix.gitleaks }}" -C "$RUNNER_TEMP/gitleaks-bin" ;; esac
+          echo "$RUNNER_TEMP/gitleaks-bin" >> "$GITHUB_PATH"
+      - if: ${{ matrix.tester }}
+        run: gitleaks version
+      - if: ${{ matrix.tester }}
+        run: npm test --workspace packages/drwil
+  # drwil-project-end jobs
+  # No branch protection is possible on a private repository on the free plan
+  # (GitHub.com's "Merge" button stays unconditional): only an after-the-fact
+  # alert is possible. Triggers only on a push to the main branch (not on
+  # pull/merge requests) and only if `checks` or `kit-tests` failed; opens no
+  # duplicate if an equivalent issue is already open.
+  alert-if-ci-broken:
+    needs: [checks, kit-tests]
+    if: always() && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && (needs.checks.result == 'failure' || needs.kit-tests.result == 'failure')
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open an issue if CI breaks on the main branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="CI broken on the main branch (run ${{ github.run_id }})"
+          open=$(gh issue list --repo "${{ github.repository }}" --search "CI broken on the main branch in:title" --state open --json number --jq 'length')
+          if [ "$open" = "0" ]; then
+            gh issue create --repo "${{ github.repository }}" --title "$title" \
+              --body "A check failed on the main branch (${{ github.event.repository.default_branch }}). See ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}. To fix before any new workstream."
+          else
+            echo "A broken-CI issue is already open, no duplicate."
+          fi

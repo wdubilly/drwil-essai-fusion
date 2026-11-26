@@ -1,0 +1,3360 @@
+import { afterEach, test } from "node:test";
+import assert from "node:assert/strict";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { PassThrough, Readable } from "node:stream";
+import { undeclaredHooks } from "./base-checks.mjs";
+import { blockingGuarantee, briefIntent, intentsLeftBehind, lastReview, missingCriteria, staleIntents } from "./briefs.mjs";
+import {
+  ACTIVITIES,
+  acceptanceCriteria,
+  declaredContracts,
+  draftAdd,
+  draftFinish,
+  NEUTRAL_STATE,
+  context,
+  main,
+  nextHead,
+  settleClosing,
+  readStdinJson,
+  requiresHuman,
+  readState,
+  move,
+  prepareTransition,
+  verifyEvidence,
+  scopedBriefs,
+  setDetour,
+  reopen,
+  writeState,
+  start,
+  stopQueue,
+  shortReminder,
+  reminderIfChanged,
+  briefStatus,
+  briefMaturity,
+  stateRoot,
+  transitionAllowed,
+  validateState,
+} from "./state.mjs";
+
+import { accept, acceptanceCheck, acceptancePoll, acceptFromPoll, criteriaFingerprint, recordAcceptance } from "./state-acceptance.mjs";
+import { mainTip, writeProof } from "./pr-watch-main.mjs";
+import { close } from "./close.mjs";
+import { intentPath, limitChoice, recordLimits } from "./state-limits.mjs";
+import { moveFromPoll, movePoll } from "./state-polls.mjs";
+
+// Un hook lancé par `git commit -a` ou depuis un worktree reçoit GIT_INDEX_FILE, GIT_DIR… :
+// hérités, ils font agir les dépôts de test, et le code testé, sur le dépôt qui lance les tests.
+for (const nom of Object.keys(process.env)) if (nom.startsWith("GIT_")) delete process.env[nom];
+
+// Chaque dossier temporaire est supprimé après son test : ces tests tournent à chaque commit,
+// et aussi dans chaque projet que génèrent les tests du kit ; sans ça, ils épuisaient les
+// inodes de /tmp. Ceux d'un test en échec sont gardés
+// (et affichés) pour le diagnostic.
+let dossiersDuTest = [];
+const tmp = (prefixe) => {
+  const dir = mkdtempSync(join(tmpdir(), prefixe));
+  dossiersDuTest.push(dir);
+  return dir;
+};
+afterEach((t) => {
+  if (t.passed === false) console.error(`dossiers gardés pour diagnostic (${t.name}) : ${dossiersDuTest.join(", ")}`);
+  else {
+    for (const dir of dossiersDuTest) {
+      // macOS (CI) : ENOTEMPTY possible pendant la suppression ; rmSync réessaie. Un dossier
+      // résiduel ne doit pas faire échouer un test réussi : signalé.
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      } catch (e) {
+        console.error(`dossier temporaire non supprimé (${t.name}) : ${dir} — ${e.code ?? e.message}`);
+      }
+    }
+  }
+  dossiersDuTest = [];
+});
+
+const FICHE = "docs/projects/exemple.md";
+
+function depot({ state: etat, fiche = true, lang, config } = {}) {
+  const racine = tmp("drwil-etat-");
+  mkdirSync(join(racine, ".drwil"));
+  mkdirSync(join(racine, "docs", "projects"), { recursive: true });
+  if (lang || config) writeFileSync(join(racine, ".drwil", "ia-first.json"), JSON.stringify({ ...(lang ? { lang } : {}), ...config }));
+  if (fiche) {
+    writeFileSync(
+      join(racine, FICHE),
+      `# Projet : Exemple
+
+**Statut** : cadré le 2026-10-09.
+
+<!-- scope
+files:
+  - src/auth/login.ts
+  - tests/auth/login.test.ts
+-->
+`,
+    );
+  }
+  if (etat !== undefined) {
+    writeFileSync(join(racine, ".drwil", "state.json"), typeof etat === "string" ? etat : JSON.stringify(etat));
+  }
+  return racine;
+}
+
+const actif = (activite, extra = {}) => ({
+  version: 1,
+  activity: activite,
+  active_brief: FICHE,
+  active_request: null,
+  since: "2026-10-09T10:00:00Z",
+  ...extra,
+});
+
+test("sans state.json : SCOPING neutre, jamais d'état actif implicite", () => {
+  const lu = readState(depot());
+  assert.equal(lu.source, "missing");
+  assert.deepEqual(lu.state, NEUTRAL_STATE);
+  assert.deepEqual(lu.problems, []);
+});
+
+test("état actif valide : activité et attente lues depuis le disque", () => {
+  const lu = readState(depot({ state: actif("BUILD") }));
+  assert.equal(lu.source, "file");
+  assert.deepEqual(lu.problems, []);
+  assert.equal(lu.state.activity, "BUILD");
+  assert.equal(lu.state.active_brief, FICHE);
+});
+
+test("JSON illisible : état invalide, ramené au neutre, problème signalé", () => {
+  const lu = readState(depot({ state: "{ pas du json" }));
+  assert.equal(lu.source, "file");
+  assert.deepEqual(lu.state, NEUTRAL_STATE);
+  assert.match(lu.problems[0], /illisible/);
+});
+
+test("validation : activité inconnue, champ inconnu, version absente", () => {
+  const racine = depot();
+  assert.match(validateState({ ...actif("CODAGE") }, racine)[0], /activité inconnue/);
+  // Le périmètre vit dans la fiche versionnée, jamais dans l'état local.
+  assert.match(validateState({ ...actif("BUILD"), perimetre_actif: ["src/"] }, racine)[0], /champ inconnu « perimetre_actif »/);
+  const { version, ...sansVersion } = actif("BUILD");
+  assert.match(validateState(sansVersion, racine)[0], /version/);
+  assert.match(validateState([], racine)[0], /objet/);
+});
+
+test("validation : SCOPING sans attente ni demande, les autres activités exigent une attente", () => {
+  const racine = depot();
+  assert.deepEqual(validateState(NEUTRAL_STATE, racine), []);
+  assert.match(validateState(actif("SCOPING"), racine)[0], /SCOPING.*aucune attente/);
+  assert.match(validateState({ ...actif("BUILD"), active_brief: null }, racine)[0], /attente active requise/);
+});
+
+test("validation : l'attente active est une fiche existante de docs/projects/, hors modèle", () => {
+  const racine = depot();
+  assert.match(validateState(actif("BUILD", { active_brief: "docs/projects/absente.md" }), racine)[0], /introuvable/);
+  assert.match(validateState(actif("BUILD", { active_brief: "src/auth/login.ts" }), racine)[0], /docs\/projects\//);
+  assert.match(validateState(actif("BUILD", { active_brief: "docs/projects/../../etc/passwd.md" }), racine)[0], /docs\/projects\//);
+  assert.match(validateState(actif("BUILD", { active_brief: "docs/projects/model-brief.md" }), racine)[0], /modèle/);
+});
+
+test("validation : active_request et depuis bien typés", () => {
+  const racine = depot();
+  assert.match(validateState(actif("REQUEST", { active_request: 42 }), racine)[0], /active_request/);
+  assert.match(validateState(actif("REQUEST", { since: "hier" }), racine)[0], /since/);
+  assert.deepEqual(validateState(actif("REQUEST", { active_request: "Lot 1" }), racine), []);
+});
+
+test("clôture : fiche déjà supprimée tolérée en CLOSING seulement, les autres règles de l'attente restent", () => {
+  const racine = depot({ fiche: false });
+  assert.deepEqual(validateState(actif("CLOSING"), racine), []);
+  for (const activite of ["EXPECTATION", "REQUEST", "BUILD", "EVIDENCE", "VERIFY"]) {
+    assert.match(validateState(actif(activite), racine)[0], /introuvable/, activite);
+  }
+  assert.match(validateState(actif("CLOSING", { active_brief: "src/auth/login.ts" }), racine)[0], /docs\/projects\//);
+  assert.match(validateState(actif("CLOSING", { active_brief: "docs/projects/model-brief.md" }), racine)[0], /modèle/);
+});
+
+test("clôture : fiche supprimée selon la recette, retour en SCOPING accepté ; contexte et rappel le disent", async () => {
+  const racine = depot({ state: actif("CLOSING"), fiche: false });
+  const lu = readState(racine);
+  assert.deepEqual(lu.problems, []);
+  const ctx = context(lu, racine);
+  assert.match(ctx, /fiche supprimée/);
+  assert.doesNotMatch(ctx, /Périmètre autorisé|invalide/);
+  assert.match(shortReminder(lu, racine), /fiche supprimée/);
+  assert.doesNotMatch(shortReminder(lu, racine), /invalide|périmètre/);
+  const r = await move(racine, { to: "SCOPING" }, { tty: false, now: MAINTENANT });
+  assert.equal(r.code, 0, r.message);
+  assert.doesNotMatch(r.message, /invalide/);
+  assert.equal(readState(racine).state.activity, "SCOPING");
+});
+
+test("transitions : une activité à la fois, retours vers BUILD, abandon vers SCOPING", () => {
+  assert.equal(transitionAllowed("SCOPING", "EXPECTATION"), true);
+  assert.equal(transitionAllowed("SCOPING", "BUILD"), false, "pas de saut en avant");
+  assert.equal(transitionAllowed("VERIFY", "BUILD"), true, "retour après échec");
+  assert.equal(transitionAllowed("EVIDENCE", "BUILD"), true);
+  assert.equal(transitionAllowed("VERIFY", "CLOSING"), true);
+  assert.equal(transitionAllowed("CLOSING", "SCOPING"), true);
+  for (const a of ACTIVITIES) if (a !== "SCOPING") assert.equal(transitionAllowed(a, "SCOPING"), true, `abandon depuis ${a}`);
+  assert.equal(transitionAllowed("BUILD", "BUILD"), false);
+  assert.equal(transitionAllowed("INCONNUE", "SCOPING"), false);
+});
+
+test("sept activités : matrice complète des transitions, une table de cas", () => {
+  const permises = {
+    SCOPING: ["EXPECTATION"],
+    EXPECTATION: ["REQUEST", "SCOPING"],
+    REQUEST: ["BUILD", "SCOPING"],
+    BUILD: ["EVIDENCE", "SCOPING"],
+    EVIDENCE: ["VERIFY", "BUILD", "SCOPING"],
+    VERIFY: ["CLOSING", "BUILD", "SCOPING"],
+    CLOSING: ["SCOPING"],
+  };
+  assert.deepEqual([...ACTIVITIES], Object.keys(permises));
+  for (const de of ACTIVITIES)
+    for (const vers of ACTIVITIES) assert.equal(transitionAllowed(de, vers), permises[de].includes(vers), `${de} → ${vers}`);
+});
+
+test("sept activités : parcours réel par move, un saut refusé laisse l'état inchangé", async () => {
+  const racine = depot({ config: { transitions: "agent" } });
+  const activite = () => readState(racine).state.activity;
+  const etapes = [
+    ["EXPECTATION", { brief: FICHE }],
+    ["REQUEST", {}],
+    ["BUILD", {}],
+    ["EVIDENCE", {}],
+    ["VERIFY", {}],
+  ];
+  for (const [vers, opts] of etapes) {
+    const r = await move(racine, { to: vers, ...opts }, { tty: false, now: MAINTENANT });
+    assert.equal(r.code, 0, `${vers} : ${r.message}`);
+    assert.equal(activite(), vers);
+  }
+  let r = await move(racine, { to: "CLOSING" }, { tty: false, now: MAINTENANT });
+  assert.equal(r.code, 1, "CLOSING refusé sans évidence de verify");
+  assert.equal(activite(), "VERIFY");
+  r = await move(racine, { to: "EXPECTATION" }, { tty: false, now: MAINTENANT });
+  assert.equal(r.code, 1);
+  assert.equal(activite(), "VERIFY");
+  r = await move(racine, { to: "BUILD" }, { tty: false, now: MAINTENANT });
+  assert.equal(r.code, 0, "retour en BUILD après un échec");
+  assert.equal(activite(), "BUILD");
+});
+
+test("contexte : SCOPING interdit la réalisation", () => {
+  const racine = depot();
+  const texte = context(readState(racine), racine);
+  assert.match(texte, /Activité : SCOPING/);
+  assert.match(texte, /aucune attente active/);
+  assert.match(texte, /aucun fichier de code/);
+});
+
+test("contexte : BUILD rappelle la fiche, son titre et son périmètre", () => {
+  const racine = depot({ state: actif("BUILD") });
+  const texte = context(readState(racine), racine);
+  assert.match(texte, /Activité : BUILD/);
+  assert.match(texte, /docs\/projects\/exemple\.md — Projet : Exemple/);
+  assert.match(texte, /- src\/auth\/login\.ts/);
+  assert.match(texte, /- tests\/auth\/login\.test\.ts/);
+});
+
+test("contexte : un état invalide est signalé, pas masqué", () => {
+  const racine = depot({ state: actif("CODAGE") });
+  const texte = context(readState(racine), racine);
+  assert.match(texte, /état invalide/i);
+  assert.match(texte, /activité inconnue/);
+});
+
+test("contexte en anglais selon .drwil/ia-first.json", () => {
+  const racine = depot({ lang: "en" });
+  assert.match(context(readState(racine), racine), /Activity: SCOPING/);
+});
+
+test("QUA-042 : rappel CLOSING : consigner la consommation du chantier, en anglais aussi", () => {
+  const fr = depot({ state: actif("CLOSING") });
+  assert.match(context(readState(fr), fr), /Consigner la consommation du chantier : `node \.githooks\/consumption\.mjs --record <fiche>`/);
+  const en = depot({ state: actif("CLOSING"), lang: "en" });
+  assert.match(context(readState(en), en), /Record the workstream's consumption: `node \.githooks\/consumption\.mjs --record <brief>`/);
+});
+
+test("QUA-040 : rappel CLOSING : langue de la carte, du README et du changelog, réglage docLang ou langue du projet", () => {
+  const ligne = (opts) => {
+    const r = depot({ state: actif("CLOSING"), ...opts });
+    return context(readState(r), r)
+      .split("\n")
+      .find((l) => /docLang/.test(l));
+  };
+  assert.equal(ligne({}), "Langue de la carte, du README et du changelog : français (réglage docLang, à défaut la langue du projet).");
+  assert.match(ligne({ config: { docLang: "en" } }), /: anglais \(réglage docLang/);
+  assert.match(ligne({ lang: "en" }), /^Language of the map, README and changelog: English \(docLang setting/);
+  assert.match(ligne({ lang: "en", config: { docLang: "fr" } }), /: French \(/);
+  assert.match(ligne({ config: { docLang: "de" } }), /: de \(/);
+  assert.match(ligne({ lang: "en", config: { docLang: "de" } }), /changelog: de \(/);
+  const build = depot({ state: actif("BUILD") });
+  assert.doesNotMatch(context(readState(build), build), /docLang/, "seulement en CLOSING");
+});
+
+test("QUA-040 : la ligne « Unreleased » se demande en BUILD, dans le dernier lot ; le rappel CLOSING ne la demande plus, en anglais aussi", () => {
+  const fr = depot({ state: actif("CLOSING") });
+  const closingFr = context(readState(fr), fr);
+  assert.match(closingFr, /README si le chantier change ce qu'il voit, carte docs\/architecture\.md s'il change la structure/);
+  assert.doesNotMatch(closingFr, /Unreleased/);
+  const en = depot({ state: actif("CLOSING"), lang: "en" });
+  const closingEn = context(readState(en), en);
+  assert.match(closingEn, /README if the workstream changes what they see, map docs\/architecture\.md if it changes the structure/);
+  assert.doesNotMatch(closingEn, /Unreleased/);
+  const buildFr = depot({ state: actif("BUILD") });
+  assert.match(
+    context(readState(buildFr), buildFr),
+    /ajouter sa ligne sous « Unreleased » du changelog \(s'il y en a un\) dans le dernier lot : la barrière de CLOSING refuse le changelog/,
+  );
+  const buildEn = depot({ state: actif("BUILD"), lang: "en" });
+  assert.match(
+    context(readState(buildEn), buildEn),
+    /add its line under « Unreleased » in the changelog \(if there is one\) in the last increment: the CLOSING scope gate refuses the changelog/,
+  );
+});
+
+test("QUA-036 : rappel CLOSING : boucler les intentions (limites en intentions, intention d'origine mise à jour ou close), en anglais aussi", () => {
+  const fr = context(readState(depot({ state: actif("CLOSING") })), depot({ state: actif("CLOSING") }));
+  assert.match(
+    fr,
+    /une limite dans le cadre a été traitée ; chaque limite hors cadre répondue « Noter en intention » au sondage des limites \(`drwil-limite`\) devient une fiche d'intention \(jamais une fiche de chantier ; la clôture refuse/,
+  );
+  assert.match(fr, /l'intention d'origine \(champ Intention de la fiche\) est mise à jour, ou résumée au journal et retirée/);
+  const racine = depot({ state: actif("CLOSING"), lang: "en" });
+  assert.match(
+    context(readState(racine), racine),
+    /a limit within the scope has been handled; each out-of-scope limit answered « Record as intent » to the limits poll \(`drwil-limite`\) becomes an intent brief \(never a workstream brief; the closing refuses/,
+  );
+});
+
+test("QUA-036 : champ Intention et date de revue : la plus récente compte (Statut, Revu le, Existant daté)", () => {
+  assert.equal(briefIntent("# P\n\n**Intention** : `docs/intentions/a.md`\n"), "docs/intentions/a.md");
+  assert.equal(briefIntent("# P\n\n**Intent**: `docs/intentions/b.md`\n"), "docs/intentions/b.md");
+  assert.equal(briefIntent("# P\n\nIntention : a.md\n"), null);
+  const texte = [
+    "**Statut** : proposée le 2026-09-01.",
+    "",
+    "**Revu le 2026-09-20** : ce qui a changé.",
+    "",
+    "## Existant (vérifié le 2026-09-10)",
+  ].join("\n");
+  assert.equal(lastReview(texte), "2026-09-20");
+  assert.equal(lastReview("**Status** (2026-08-02): to scope.\n\n## Current state (checked on 2026-08-05)\n"), "2026-08-05");
+  assert.equal(lastReview("**Statut** : proposée le AAAA-MM-JJ.\n"), null);
+});
+
+test("QUA-036 : intentions sans revue depuis 30 jours signalées, les plus anciennes d'abord ; README et intention non datée ignorés", () => {
+  const racine = depot();
+  mkdirSync(join(racine, "docs", "intentions"), { recursive: true });
+  const ecrire = (f, statut) => writeFileSync(join(racine, "docs", "intentions", f), `# I\n\n**Statut** : ${statut}\n`);
+  ecrire("ancienne.md", "proposée le 2026-08-01.");
+  ecrire("vieille.md", "proposée le 2026-09-01.");
+  ecrire("recente.md", "proposée le 2026-10-01.");
+  ecrire("README.md", "proposée le 2020-01-01.");
+  ecrire("sans-date.md", "proposée.");
+  const maintenant = new Date("2026-10-16T00:00:00Z").getTime();
+  assert.deepEqual(staleIntents(racine, {}, maintenant), [
+    { file: "docs/intentions/ancienne.md", days: 76 },
+    { file: "docs/intentions/vieille.md", days: 45 },
+  ]);
+  assert.deepEqual(staleIntents(racine, { dirs: { intentions: "idees" } }, maintenant), [], "dossier réglé absent");
+});
+
+test("QUA-036 : au commit, une fiche supprimée sans que son intention soit touchée est signalée ; touchée ou absente, rien", () => {
+  const racine = depot();
+  const git = (...args) => spawnSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: racine, encoding: "utf8" });
+  mkdirSync(join(racine, "docs", "intentions"), { recursive: true });
+  writeFileSync(join(racine, "docs", "intentions", "origine.md"), "# Intention\n");
+  writeFileSync(join(racine, FICHE), `${readFileSync(join(racine, FICHE), "utf8")}\n**Intention** : \`docs/intentions/origine.md\`\n`);
+  git("init", "-q");
+  git("add", "-A");
+  git("commit", "-qm", "base");
+  git("rm", "-q", FICHE);
+  assert.deepEqual(intentsLeftBehind(racine, [FICHE]), [{ brief: FICHE, intent: "docs/intentions/origine.md" }]);
+  assert.deepEqual(intentsLeftBehind(racine, [FICHE, "docs/intentions/origine.md"]), [], "intention mise à jour dans le même commit");
+  git("rm", "-q", "docs/intentions/origine.md");
+  assert.deepEqual(intentsLeftBehind(racine, [FICHE, "docs/intentions/origine.md"]), [], "intention retirée dans le même commit");
+  assert.deepEqual(intentsLeftBehind(tmp("drwil-hors-git-"), []), [], "hors dépôt git : rien");
+});
+
+const MAINTENANT = "2026-10-09T12:00:00Z";
+const neutre = () => ({ state: { ...NEUTRAL_STATE }, source: "missing", problems: [] });
+
+test("préparer : ouvrir une attente exige une fiche existante", () => {
+  const racine = depot();
+  assert.deepEqual(prepareTransition(neutre(), "EXPECTATION", { brief: FICHE, now: MAINTENANT }, racine).state, {
+    version: 1,
+    activity: "EXPECTATION",
+    active_brief: FICHE,
+    active_request: null,
+    since: MAINTENANT,
+    history: [{ activity: "EXPECTATION", at: MAINTENANT }],
+  });
+  assert.match(prepareTransition(neutre(), "EXPECTATION", { now: MAINTENANT }, racine).error, /--brief/);
+  assert.match(
+    prepareTransition(neutre(), "EXPECTATION", { brief: "docs/projects/absente.md", now: MAINTENANT }, racine).error,
+    /introuvable/,
+  );
+});
+
+test("préparer : transition interdite refusée, --brief réservé à l'ouverture, abandon vers le neutre", () => {
+  const racine = depot();
+  assert.match(prepareTransition(neutre(), "BUILD", { now: MAINTENANT }, racine).error, /SCOPING → BUILD.*interdite/);
+  const enCours = { state: actif("BUILD"), source: "file", problems: [] };
+  assert.match(prepareTransition(enCours, "EVIDENCE", { brief: FICHE, now: MAINTENANT }, racine).error, /--brief/);
+  const suite = prepareTransition(enCours, "EVIDENCE", { request: "Lot 2", now: MAINTENANT }, racine).state;
+  assert.equal(suite.active_brief, FICHE, "l'attente suit");
+  assert.equal(suite.active_request, "Lot 2");
+  assert.deepEqual(prepareTransition(enCours, "SCOPING", { now: MAINTENANT }, racine).state, {
+    ...NEUTRAL_STATE,
+    since: MAINTENANT,
+    history: [{ activity: "SCOPING", at: MAINTENANT }],
+  });
+});
+
+test("humain requis (mode humain) : ouvrir et lancer la réalisation, pas clore ; rien en mode agent", () => {
+  assert.equal(requiresHuman("SCOPING", "EXPECTATION", "human"), true);
+  assert.equal(requiresHuman("REQUEST", "BUILD", "human"), true);
+  assert.equal(requiresHuman("VERIFY", "CLOSING", "human"), false, "clore retire des droits : libre sur évidence valide");
+  assert.equal(requiresHuman("BUILD", "EVIDENCE", "human"), false);
+  assert.equal(requiresHuman("VERIFY", "BUILD", "human"), false, "retour sur la même attente");
+  assert.equal(requiresHuman("BUILD", "SCOPING", "human"), false, "l'abandon resserre les droits");
+  for (const [de, vers] of [
+    ["SCOPING", "EXPECTATION"],
+    ["REQUEST", "BUILD"],
+    ["VERIFY", "CLOSING"],
+  ])
+    assert.equal(requiresHuman(de, vers, "agent"), false);
+});
+
+test("passer (mode humain par défaut) : refus sans terminal interactif, état inchangé", async () => {
+  const racine = depot();
+  const r = await move(racine, { to: "EXPECTATION", brief: FICHE }, { tty: false, now: MAINTENANT });
+  assert.equal(r.code, 1);
+  assert.match(r.message, /terminal interactif/);
+  assert.equal(readState(racine).source, "missing");
+});
+
+test("passer : avec un humain qui confirme, l'état est écrit ; sans confirmation, rien", async () => {
+  const racine = depot();
+  const refus = await move(racine, { to: "EXPECTATION", brief: FICHE }, { tty: true, confirm: async () => false, now: MAINTENANT });
+  assert.equal(refus.code, 1);
+  assert.equal(readState(racine).source, "missing");
+  let question = "";
+  const ok = await move(
+    racine,
+    { to: "EXPECTATION", brief: FICHE },
+    {
+      tty: true,
+      confirm: async (q) => {
+        question = q;
+        return true;
+      },
+      now: MAINTENANT,
+    },
+  );
+  assert.equal(ok.code, 0, ok.message);
+  assert.match(question, /EXPECTATION/);
+  assert.equal(readState(racine).state.activity, "EXPECTATION");
+  // Transition libre ensuite : pas de terminal requis.
+  assert.equal((await move(racine, { to: "REQUEST", request: "Lot 2" }, { tty: false, now: MAINTENANT })).code, 0);
+  assert.equal(readState(racine).state.active_request, "Lot 2");
+});
+
+test("passer (mode agent) : toute transition permise est libre ; une interdite reste refusée", async () => {
+  const racine = depot({ config: { transitions: "agent" } });
+  assert.equal((await move(racine, { to: "EXPECTATION", brief: FICHE }, { tty: false, now: MAINTENANT })).code, 0);
+  const saut = await move(racine, { to: "VERIFY" }, { tty: false, now: MAINTENANT });
+  assert.equal(saut.code, 1);
+  assert.match(saut.message, /interdite/);
+});
+
+test("passer : depuis un état invalide, on repart du neutre (signalé)", async () => {
+  const racine = depot({ state: "{ cassé", config: { transitions: "agent" } });
+  const r = await move(racine, { to: "EXPECTATION", brief: FICHE }, { tty: false, now: MAINTENANT });
+  assert.equal(r.code, 0, r.message);
+  assert.match(r.message, /invalide/);
+  assert.equal(readState(racine).state.activity, "EXPECTATION");
+});
+
+test("contexte : indique la commande de transition", () => {
+  const racine = depot();
+  assert.match(context(readState(racine), racine), /node \.githooks\/state\.mjs move/);
+});
+
+// Dépôt git commité, prêt à clore : l'évidence est jugée contre HEAD.
+function depotEnVerify(config, ajoutFiche = "") {
+  const racine = depot({ state: actif("VERIFY"), config });
+  if (ajoutFiche) writeFileSync(join(racine, FICHE), readFileSync(join(racine, FICHE), "utf8") + ajoutFiche);
+  writeFileSync(join(racine, ".gitignore"), ".drwil/state.json\n.drwil/evidence/\n");
+  const git = (...args) => spawnSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: racine, encoding: "utf8" });
+  git("init", "-q");
+  git("add", "-A");
+  git("commit", "-qm", "init");
+  const head = git("rev-parse", "HEAD").stdout.trim();
+  const evidence = (nom, contenu) => {
+    mkdirSync(join(racine, ".drwil", "evidence"), { recursive: true });
+    writeFileSync(
+      join(racine, ".drwil", "evidence", nom),
+      typeof contenu === "string" ? contenu : JSON.stringify({ version: 1, commit: head, dirtyWorktree: false, ...contenu }),
+    );
+  };
+  return { racine, evidence };
+}
+
+test("clôture : sans évidence de verify, refusée avant toute question à l'humain", async () => {
+  const { racine } = depotEnVerify();
+  let demande = false;
+  const r = await move(racine, { to: "CLOSING" }, { tty: true, confirm: async () => (demande = true), now: MAINTENANT });
+  assert.equal(r.code, 1);
+  assert.match(r.message, /aucune évidence.*drwil verify --evidence/);
+  assert.equal(demande, false);
+  assert.equal(readState(racine).state.activity, "VERIFY");
+});
+
+test("clôture : PASS ou ATTESTED sur HEAD, arbre propre, autorise sans geste humain", async () => {
+  for (const status of ["pass", "attested"]) {
+    const { racine, evidence } = depotEnVerify();
+    evidence("verify-2026-10-09T10-00-00-000Z.json", { status });
+    assert.deepEqual(verifyEvidence(racine), { ok: true });
+    const r = await move(racine, { to: "CLOSING" }, { tty: false, now: MAINTENANT });
+    assert.equal(r.code, 0, r.message);
+    assert.equal(readState(racine).state.activity, "CLOSING");
+  }
+});
+
+test("QUA-021 : clôture : sans critères, refusée si newRequirements l'impose ; avertie sinon, en anglais aussi", async () => {
+  const exige = depotEnVerify({ newRequirements: "blocking" });
+  exige.evidence("verify-2026-10-09T10-00-00-000Z.json", { status: "pass" });
+  const refus = await move(exige.racine, { to: "CLOSING" }, { tty: false, now: MAINTENANT });
+  assert.equal(refus.code, 1);
+  assert.match(refus.message, /^clôture refusée : la fiche « docs\/projects\/exemple\.md » n'a aucun critère d'acceptation/);
+  assert.equal(readState(exige.racine).state.activity, "VERIFY");
+  const anglais = depotEnVerify({ lang: "en" });
+  anglais.evidence("verify-2026-10-09T10-00-00-000Z.json", { status: "pass" });
+  const averti = await move(anglais.racine, { to: "CLOSING" }, { tty: false, now: MAINTENANT });
+  assert.equal(averti.code, 0, averti.message);
+  assert.match(averti.message, /warning: brief "docs\/projects\/exemple\.md" has no acceptance criterion/);
+});
+
+test("QUA-021 : missingCriteria : aucune fiche active, fiche absente ou avec critères, entretien courant : rien à signaler", () => {
+  const { racine } = depotCadre({ newRequirements: "blocking" });
+  assert.equal(missingCriteria(racine, null), null);
+  assert.equal(missingCriteria(racine, "docs/projects/absente.md"), null);
+  assert.equal(missingCriteria(racine, "docs/projects/routine-maintenance.md"), null);
+  assert.equal(missingCriteria(racine, FICHE), "blocking");
+  writeFileSync(join(racine, FICHE), "# Exemple\n\n## Critères d'acceptation\n\n- Un critère — `QUA-001`\n");
+  assert.equal(missingCriteria(racine, FICHE), null);
+});
+
+test("QUA-021 : lancement : sans critères, refusé si newRequirements l'impose, averti sinon ; l'entretien courant en est exempt", () => {
+  const exige = depotCadre({ newRequirements: "blocking" }).racine;
+  const refus = start(exige, FICHE, { human: true, now: MAINTENANT });
+  assert.equal(refus.code, 1);
+  assert.match(refus.message, /^lancement refusé : la fiche « docs\/projects\/exemple\.md » n'a aucun critère d'acceptation/);
+  assert.equal(readState(exige).source, "missing", "rien n'est écrit");
+  const averti = start(depotCadre().racine, FICHE, { human: true, now: MAINTENANT });
+  assert.equal(averti.code, 0);
+  assert.match(averti.message, /\navertissement : la fiche « docs\/projects\/exemple\.md » n'a aucun critère/);
+  const anglais = start(depotCadre({ lang: "en", newRequirements: "blocking" }).racine, FICHE, { human: true });
+  assert.match(anglais.message, /^start refused: brief "docs\/projects\/exemple\.md" has no acceptance criterion/);
+
+  const routine = depotCadre({ newRequirements: "blocking" });
+  // Comme la vraie fiche d'entretien courant : permanente, sans statut ni critères.
+  writeFileSync(
+    join(routine.racine, "docs", "projects", "routine-maintenance.md"),
+    "# Entretien courant\n\n<!-- scope\nfiles:\n  - src/z.ts\n-->\n",
+  );
+  routine.git("add", "-A");
+  routine.git("commit", "-qm", "routine");
+  const r = start(routine.racine, "docs/projects/routine-maintenance.md", { human: true });
+  assert.equal(r.code, 0, r.message);
+  assert.doesNotMatch(r.message, /critère/);
+});
+
+test("QUA-021 : clôture : une fiche sans critères d'acceptation est avertie, la clôture passe ; avec critères, aucun avertissement", async () => {
+  const sans = depotEnVerify();
+  sans.evidence("verify-2026-10-09T10-00-00-000Z.json", { status: "pass" });
+  const averti = await move(sans.racine, { to: "CLOSING" }, { tty: false, now: MAINTENANT });
+  assert.equal(averti.code, 0, averti.message);
+  assert.match(averti.message, /avertissement.*exemple\.md.*aucun critère d'acceptation/);
+  assert.equal(readState(sans.racine).state.activity, "CLOSING");
+
+  const avec = depotEnVerify(undefined, "\n## Critères d'acceptation\n\n- Un export vide est refusé — `CTR-012`\n");
+  avec.evidence("verify-2026-10-09T10-00-00-000Z.json", { status: "pass", criteria: [] });
+  const r = await move(avec.racine, { to: "CLOSING" }, { tty: false, now: MAINTENANT });
+  assert.equal(r.code, 0, r.message);
+  assert.doesNotMatch(r.message, /critère/);
+});
+
+test("clôture : FAIL et ERROR renvoient en BUILD, MANUAL à l'attestation humaine", () => {
+  const attendus = { fail: /FAIL.*move BUILD/, error: /ERROR.*move BUILD/, manual: /MANUAL.*drwil attest/ };
+  for (const [status, motif] of Object.entries(attendus)) {
+    const { racine, evidence } = depotEnVerify();
+    evidence("verify-2026-10-09T10-00-00-000Z.json", { status });
+    const p = verifyEvidence(racine);
+    assert.equal(p.ok, false);
+    assert.match(p.reason, motif);
+  }
+});
+
+test("clôture : un critère d'acceptation non prouvé est refusé, nommé ; tous prouvés, ou sans critères, acceptés", () => {
+  const nom = "verify-2026-10-09T10-00-00-000Z.json";
+  const critere = (text, status) => ({ text, link: "CTR-012", human: false, status, proof: null });
+  const refuse = (criteria) => {
+    const { racine, evidence } = depotEnVerify();
+    evidence(nom, { status: "pass", criteria });
+    return verifyEvidence(racine);
+  };
+  const sansPreuve = refuse([critere("Un export vide est refusé", "pass"), critere("Le total est exact", "no-proof")]);
+  assert.equal(sansPreuve.ok, false);
+  assert.match(sansPreuve.reason, /« Le total est exact » \(no-proof\)/);
+  assert.doesNotMatch(sansPreuve.reason, /export vide/);
+  for (const status of ["unknown-proof", "not-durable", "not-pass"]) assert.equal(refuse([critere("C", status)]).ok, false, status);
+  assert.deepEqual(refuse([critere("Un export vide est refusé", "pass")]), { ok: true });
+  const { racine: r2, evidence: e2 } = depotEnVerify();
+  e2(nom, { status: "pass", criteria: [], undeclared: ["QUA-001"] });
+  assert.match(verifyEvidence(r2).reason, /modifié\(s\) sans déclaration : QUA-001.*Contrats modifiés/);
+  e2(nom, { status: "pass", criteria: [], undeclared: [] });
+  assert.deepEqual(verifyEvidence(r2), { ok: true });
+  assert.deepEqual(refuse([]), { ok: true });
+  const { racine, evidence } = depotEnVerify();
+  evidence(nom, { status: "attested" });
+  assert.deepEqual(verifyEvidence(racine), { ok: true });
+});
+
+test("clôture : seule la dernière évidence compte", () => {
+  const { racine, evidence } = depotEnVerify();
+  evidence("verify-2026-10-09T10-00-00-000Z.json", { status: "pass" });
+  evidence("verify-2026-10-09T11-00-00-000Z.json", { status: "fail" });
+  assert.match(verifyEvidence(racine).reason, /FAIL/);
+});
+
+test("clôture : évidence d'un autre commit, d'un arbre modifié ou illisible, refusée", () => {
+  const autre = depotEnVerify();
+  autre.evidence("verify-a.json", { status: "pass", commit: "0".repeat(40) });
+  assert.match(verifyEvidence(autre.racine).reason, /autre commit/);
+
+  const sale = depotEnVerify();
+  sale.evidence("verify-a.json", { status: "pass", dirtyWorktree: true });
+  assert.match(verifyEvidence(sale.racine).reason, /arbre modifié/);
+
+  // Modifié après verify : ce qui serait clos n'est pas ce qui a été vérifié.
+  const apres = depotEnVerify();
+  apres.evidence("verify-a.json", { status: "pass" });
+  writeFileSync(join(apres.racine, FICHE), readFileSync(join(apres.racine, FICHE), "utf8") + "\nmodifié\n");
+  assert.match(verifyEvidence(apres.racine).reason, /arbre modifié/);
+
+  const casse = depotEnVerify();
+  casse.evidence("verify-a.json", "{ cassé");
+  assert.match(verifyEvidence(casse.racine).reason, /illisible/);
+});
+
+test("clôture : la preuve est exigée aussi en mode agent", async () => {
+  const { racine } = depotEnVerify({ transitions: "agent" });
+  const r = await move(racine, { to: "CLOSING" }, { tty: false, now: MAINTENANT });
+  assert.equal(r.code, 1);
+  assert.match(r.message, /clôture refusée/);
+});
+
+test("clôture : hors dépôt git, refusée", () => {
+  const racine = depot({ state: actif("VERIFY") });
+  mkdirSync(join(racine, ".drwil", "evidence"));
+  writeFileSync(join(racine, ".drwil", "evidence", "verify-a.json"), JSON.stringify({ status: "pass", commit: "x", dirtyWorktree: false }));
+  assert.match(verifyEvidence(racine).reason, /HEAD introuvable/);
+});
+
+test("scopeGate: off : contexte réduit à « gouvernance désactivée », même avec un état actif", () => {
+  for (const [lang, motif] of [
+    ["fr", /Gouvernance désactivée/],
+    ["en", /Governance disabled/],
+  ]) {
+    const racine = depot({ state: actif("BUILD"), config: { scopeGate: "off", lang } });
+    const texte = context(readState(racine), racine);
+    assert.match(texte, motif);
+    assert.doesNotMatch(texte, /BUILD|cadrage/);
+  }
+});
+
+test("messages : commandes drwil complètes (npx), jamais « drwil » seul", () => {
+  const { racine } = depotEnVerify();
+  assert.match(verifyEvidence(racine).reason, /`npx drwil verify --evidence`/);
+  assert.match(context(readState(racine), racine), /`npx drwil verify --evidence`/);
+});
+
+test("QUA-159 : le rappel de VERIFY propose, après un FAIL, --failed puis la passe complète, dans les deux langues", () => {
+  const fr = depot({ state: actif("VERIFY") });
+  assert.match(
+    context(readState(fr), fr),
+    /FAIL ou ERROR : revenir en BUILD, corriger, rejouer les seuls échecs \(`npx drwil verify --failed` : verdict partiel, jamais une preuve de clôture\), puis refaire la passe complète `npx drwil verify --evidence`/,
+  );
+  const en = depot({ state: actif("VERIFY"), lang: "en" });
+  assert.match(
+    context(readState(en), en),
+    /replay only the failures \(`npx drwil verify --failed`: a partial verdict, never a closing proof\), then redo the full pass `npx drwil verify --evidence`/,
+  );
+});
+
+test("rappel court : activité, fiche et taille du périmètre en deux lignes ; état invalide signalé", () => {
+  const racine = depot({ state: actif("BUILD") });
+  const texte = shortReminder(readState(racine), racine);
+  assert.equal(texte.split("\n").length, 2);
+  assert.match(texte, /BUILD · docs\/projects\/exemple\.md · périmètre : 2 fichier/);
+  assert.match(texte, /Règle : réaliser l'attente/);
+  const neutre = depot();
+  assert.match(shortReminder(readState(neutre), neutre), /SCOPING · aucune attente active/);
+  const casse = depot({ state: "{ cassé" });
+  assert.match(shortReminder(readState(casse), casse), /état invalide/);
+});
+
+test("rappel court : rien quand la gouvernance est désactivée (scopeGate: off)", () => {
+  const racine = depot({ state: actif("BUILD"), config: { scopeGate: "off" } });
+  assert.equal(shortReminder(readState(racine), racine), null);
+  assert.equal(reminderIfChanged(racine), null);
+});
+
+test("rappel seulement si l'état a changé ; empreinte illisible : rappel injecté", async () => {
+  const racine = depot({ config: { transitions: "agent" } });
+  assert.match(reminderIfChanged(racine), /SCOPING/);
+  assert.equal(reminderIfChanged(racine), null, "inchangé : rien");
+  assert.equal((await move(racine, { to: "EXPECTATION", brief: FICHE }, { tty: false, now: MAINTENANT })).code, 0);
+  assert.match(reminderIfChanged(racine), /EXPECTATION/, "changé : rappel");
+  writeFileSync(join(racine, ".drwil", "reminder.json"), "{ cassé");
+  assert.match(reminderIfChanged(racine), /EXPECTATION/, "jamais masqué");
+});
+
+// Dépôt git dont la fiche exemple (bloc cadrage) est commitée : une fiche cadrée.
+function depotCadre(config) {
+  const racine = depot({ config });
+  const git = (...args) => spawnSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: racine, encoding: "utf8" });
+  writeFileSync(join(racine, ".gitignore"), ".drwil/\n");
+  writeFileSync(join(racine, "docs", "projects", "sans-cadrage.md"), "# Sans cadrage\n");
+  writeFileSync(
+    join(racine, "docs", "projects", "finie.md"),
+    "# Finie\n\n**Statut** : terminé le 2026-10-01.\n\n<!-- scope\nfiles:\n  - src/x.ts\n-->\n",
+  );
+  writeFileSync(
+    join(racine, "docs", "projects", "reference.md"),
+    "# Référence\n\n**Statut** : référence — mécanique du kit.\n\n<!-- scope\nfiles:\n  - src/r.ts\n-->\n",
+  );
+  writeFileSync(join(racine, "docs", "projects", "modele-fiche-projet.md"), "# Modèle\n\n<!-- scope\nfiles:\n  - src/y.ts\n-->\n");
+  git("init", "-q");
+  git("add", "-A");
+  git("commit", "-qm", "init");
+  return { racine, git };
+}
+
+test("fiche terminée : seul le marqueur explicite compte ; référence reconnue", () => {
+  assert.equal(briefStatus("# F\n\n**Statut** : terminé le 2026-10-10.\n"), "done");
+  assert.equal(briefStatus("# F\n\n**Status**: done on 2026-10-10.\n"), "done");
+  assert.equal(briefStatus("# F\n\n**Statut** : référence — mécanique du kit.\n"), "reference");
+  assert.equal(briefStatus("# F\n\n**Status**: reference — kit mechanics.\n"), "reference");
+  for (const statut of [
+    "cadré le 2026-10-06 — lots 1 à 4 livrés, essai réel fait.",
+    "fait (lot 1) le 2026-10-05.",
+    "terminé, sans date.",
+  ]) {
+    assert.equal(briefStatus(`# F\n\n**Statut** : ${statut}\n`), "open", statut);
+  }
+  assert.equal(briefStatus("# F\n\nSans statut.\n"), "open");
+});
+
+test("clôture : retour en SCOPING refusé si la fiche terminée est encore là", async () => {
+  const racine = depot({ state: actif("CLOSING"), fiche: false });
+  writeFileSync(join(racine, FICHE), "# Projet : Exemple\n\n**Statut** : terminé le 2026-10-10.\n");
+  const refus = await move(racine, { to: "SCOPING" }, { tty: false, now: MAINTENANT });
+  assert.equal(refus.code, 1);
+  assert.match(refus.message, /terminée.*journal/);
+  assert.equal(readState(racine).state.activity, "CLOSING");
+  // Lots encore ouverts : la fiche reste, le retour passe.
+  writeFileSync(join(racine, FICHE), "# Projet : Exemple\n\n**Statut** : cadré — lot 1 fait, lot 2 ouvert.\n");
+  assert.equal((await move(racine, { to: "SCOPING" }, { tty: false, now: MAINTENANT })).code, 0);
+});
+
+test("QUA-023 : contrats modifiés : ID en tête de chaque puce de la section, autres sections ignorées, fiche en anglais", () => {
+  const fiche = [
+    "## Critères d'acceptation",
+    "- Un export vide est refusé — `QUA-009`",
+    "## 4. Contrats modifiés",
+    "",
+    "- `QUA-012` — ancien critère : « strict » — raison : assoupli",
+    "  suite de la raison, `QUA-099` cité sans être déclaré",
+    "- sans ID en tête — `QUA-098`",
+    "- `QUA-013` — raison : précisé",
+    "## Reprise",
+    "- `QUA-014` hors section",
+  ].join("\n");
+  assert.deepEqual(declaredContracts(fiche), ["QUA-012", "QUA-013"]);
+  assert.deepEqual(declaredContracts("## Modified contracts\n\n- `SEC-001` — reason: widened\n"), ["SEC-001"]);
+  assert.deepEqual(declaredContracts("# Sans section\n- `QUA-001`\n"), []);
+});
+
+test("critères d'acceptation : liste structurée (lien, humain), ignore les autres sections, fiche en anglais", () => {
+  const fr = [
+    "# Projet",
+    "",
+    "## Critères d'acceptation",
+    "",
+    "(consigne, pas un critère)",
+    "",
+    "- Un export vide est refusé — `CTR-012`",
+    "- Le libellé est clair [humain] — `MAN-003`",
+    "- Un critère sans preuve",
+    "",
+    "## 2. Hors périmètre",
+    "",
+    "- Pas un critère `CTR-999`",
+  ].join("\n");
+  assert.deepEqual(acceptanceCriteria(fr), [
+    { text: "Un export vide est refusé", link: "CTR-012", human: false },
+    { text: "Le libellé est clair", link: "MAN-003", human: true },
+    { text: "Un critère sans preuve", link: null, human: false },
+  ]);
+  const en = "## Acceptance criteria\n\n- Export is checked [human]\n- Totals match — `QUA-001`\n\n## 2. Out of scope\n";
+  assert.deepEqual(acceptanceCriteria(en), [
+    { text: "Export is checked", link: null, human: true },
+    { text: "Totals match", link: "QUA-001", human: false },
+  ]);
+  assert.deepEqual(acceptanceCriteria("# Sans section\n\n- rien\n"), []);
+  // Critère sur plusieurs lignes : la preuve est en fin de puce ; du code cité avant n'en est pas une.
+  const plusieursLignes = [
+    "## Critères d'acceptation",
+    "- Un `init` neuf fournit un contrat",
+    "  d'exemple — `QUA-024`",
+    "- Second critère",
+    "",
+    "  paragraphe après une ligne vide, pas une suite",
+    "Texte collé, pas une suite non plus `QUA-999`",
+  ].join("\n");
+  assert.deepEqual(acceptanceCriteria(plusieursLignes), [
+    { text: "Un init neuf fournit un contrat d'exemple", link: "QUA-024", human: false },
+    { text: "Second critère", link: null, human: false },
+  ]);
+});
+
+test("QUA-174 : la classification des critères ignore les marques citées en code et conserve leur libellé", () => {
+  for (const marque of ["[humain]", "[human]", "[HUMAIN]", "[HUMAN]"]) {
+    for (const delimiteur of ["`", "``"]) {
+      const citation = `${delimiteur}${marque}${delimiteur}`;
+      const texte = `La marque ${citation} reste du texte`;
+      const lire = (fin = "") => acceptanceCriteria(`## Critères d'acceptation\n- ${texte}${fin} — \`QUA-174\``);
+      assert.deepEqual(lire(), [{ text: texte, link: "QUA-174", human: false }]);
+      assert.deepEqual(lire(` ${marque}`), [{ text: texte, link: "QUA-174", human: true }]);
+    }
+  }
+});
+
+test("maturité : champ explicite lu dans l'en-tête (FR et EN), absent ou inconnu = non renseignée", () => {
+  const f = (ligne) => `# F\n\n**Statut** : cadré.\n${ligne}\n`;
+  assert.equal(briefMaturity(f("**Maturité** : prêt")), "ready");
+  assert.equal(briefMaturity(f("**Maturité** : à affiner — points ouverts")), "refine");
+  assert.equal(briefMaturity(f("**Maturité** : en cours")), "in-progress");
+  assert.equal(briefMaturity(f("**Maturity**: ready")), "ready");
+  assert.equal(briefMaturity(f("**Maturity**: to refine")), "refine");
+  assert.equal(briefMaturity(f("**Maturity**: in progress")), "in-progress");
+  assert.equal(briefMaturity(f("**Maturité** : PRÊT")), "ready");
+  assert.equal(briefMaturity(f("**Maturité** : bientôt")), "unset");
+  assert.equal(briefMaturity("# F\n\n**Statut** : cadré.\n"), "unset");
+  assert.equal(briefMaturity(`# F\n${"\n".repeat(20)}**Maturité** : prêt\n`), "unset");
+});
+
+test("fiches cadrées : prêtes d'abord, puis priorité de l'index ([P2] sans tag) ; décisions ouvertes comptées", () => {
+  const { racine, git } = depotCadre();
+  const fiche = (titre, points) =>
+    `# ${titre}\n\n**Statut** : cadré le 2026-10-10.\n\n<!-- scope\nfiles:\n  - src/${titre}.ts\n-->\n\n## 5. Points à trancher\n\n${points}\n\n## 6. Lots\n\n- [décision] hors section, non compté.\n`;
+  writeFileSync(
+    join(racine, "docs", "projects", "bloquee.md"),
+    fiche("bloquee", "- [décision] Choisir A ou B ?\n- ~~Tranché~~ — voir Décisions."),
+  );
+  writeFileSync(join(racine, "docs", "projects", "sans-tag.md"), fiche("sans-tag", "- ~~Tranché~~ — voir Décisions."));
+  writeFileSync(
+    join(racine, "docs", "projects", "anglaise.md"),
+    "# anglaise\n\n**Status**: scoped on 2026-10-10.\n\n<!-- scope\nfiles:\n  - src/en.ts\n-->\n\n## 5. Points to decide\n\n- [decision] A or B?\n- [decision] C or D?\n",
+  );
+  writeFileSync(
+    join(racine, "docs", "projects", "pending.md"),
+    [
+      "# Index",
+      "",
+      "Priorité : `[P0]` le plus urgent.",
+      "",
+      `- [ ] [IA] [P3] Exemple — \`${FICHE}\`.`,
+      "- [ ] [décision] [P1] Bloquée —",
+      "  `docs/projects/bloquee.md`.",
+      "- [x] [IA] [P0] point fait d'une fiche ouverte — `docs/projects/sans-tag.md`.",
+      "- [ ] [IA] Sans tag — `docs/projects/sans-tag.md`.",
+      "- [ ] [IA] [P1] Anglaise — `docs/projects/anglaise.md`.",
+      "",
+    ].join("\n"),
+  );
+  git("add", "-A");
+  git("commit", "-qm", "fiches");
+  const fiches = scopedBriefs(racine);
+  assert.deepEqual(
+    fiches.map((f) => [f.path, f.priority, f.decisions, f.ready]),
+    [
+      ["docs/projects/sans-tag.md", "P2", 0, true],
+      [FICHE, "P3", 0, true],
+      ["docs/projects/anglaise.md", "P1", 2, false],
+      ["docs/projects/bloquee.md", "P1", 1, false],
+    ],
+  );
+});
+
+test("fiches cadrées : à maturité égale la priorité décide ; « à affiner » classée en dernier mais jamais masquée", () => {
+  const { racine, git } = depotCadre();
+  const fiche = (nom, maturite) =>
+    `# ${nom}\n\n**Statut** : cadré le 2026-10-10.\n${maturite}\n\n<!-- scope\nfiles:\n  - src/${nom}.ts\n-->\n\n## 5. Points à trancher\n\n(aucun.)\n`;
+  writeFileSync(join(racine, "docs", "projects", "aa-affiner.md"), fiche("aa-affiner", "**Maturité** : à affiner"));
+  writeFileSync(join(racine, "docs", "projects", "zz-pret.md"), fiche("zz-pret", "**Maturité** : prêt"));
+  writeFileSync(join(racine, "docs", "projects", "mm-cours.md"), fiche("mm-cours", "**Maturité** : en cours"));
+  git("add", "-A");
+  git("commit", "-qm", "maturité");
+  assert.deepEqual(
+    scopedBriefs(racine).map((f) => [f.path, f.maturity]),
+    [
+      ["docs/projects/zz-pret.md", "ready"],
+      [FICHE, "unset"],
+      ["docs/projects/mm-cours.md", "in-progress"],
+      ["docs/projects/aa-affiner.md", "refine"],
+    ],
+  );
+});
+
+test("QUA-160 fiches cadrées : le sondage suit l'ordre de « Fiches cadrées », une fiche pas prête garde sa place, les non indexées après", () => {
+  const { racine, git } = depotCadre();
+  const fiche = (nom, points, maturite) =>
+    `# ${nom}\n\n**Statut** : cadré le 2026-10-10.\n${maturite}\n\n<!-- scope\nfiles:\n  - src/${nom}.ts\n-->\n\n## 5. Points à trancher\n\n${points}\n`;
+  const ouverte = "- [décision] Choisir A ou B ?";
+  writeFileSync(join(racine, "docs", "projects", "premiere.md"), fiche("premiere", ouverte, "**Maturité** : à affiner"));
+  writeFileSync(join(racine, "docs", "projects", "seconde.md"), fiche("seconde", "(aucun.)", "**Maturité** : prêt"));
+  writeFileSync(join(racine, "docs", "projects", "hors-index.md"), fiche("hors-index", "(aucun.)", "**Maturité** : prêt"));
+  writeFileSync(
+    join(racine, "docs", "projects", "pending.md"),
+    [
+      "# Index",
+      "",
+      "## Fiches cadrées, dans l'ordre de réalisation",
+      "",
+      "- [ ] [IA] [P3] Première, pas prête —",
+      "  `docs/projects/premiere.md`.",
+      "- [x] [IA] [P0] Faite — `docs/projects/hors-index.md`.",
+      "- [ ] [IA] [P1] Seconde — `docs/projects/seconde.md`.",
+      "",
+      "## Intentions par thème",
+      "",
+      `- [ ] [IA] [P0] Hors section — \`${FICHE}\`.`,
+      "",
+    ].join("\n"),
+  );
+  git("add", "-A");
+  git("commit", "-qm", "ordre");
+  const fiches = scopedBriefs(racine);
+  assert.deepEqual(
+    fiches.map((f) => f.path),
+    ["docs/projects/premiere.md", "docs/projects/seconde.md", "docs/projects/hors-index.md", FICHE],
+  );
+  assert.equal(fiches[0].ready, false);
+  // Une fiche de garantie bloquante reste seule listée, même indexée après d'autres.
+  writeFileSync(join(racine, "docs", "projects", "garantie.md"), fiche("garantie", "(aucun.)", "**Garantie** : bloquante"));
+  git("add", "-A");
+  git("commit", "-qm", "garantie");
+  assert.deepEqual(
+    scopedBriefs(racine).map((f) => f.path),
+    ["docs/projects/garantie.md"],
+  );
+});
+
+test("QUA-088 fiches cadrées : tant qu'une fiche de garantie bloquante existe, elle seule est proposée", () => {
+  const { racine, git } = depotCadre();
+  const fiche = (nom, entete) =>
+    `# ${nom}\n\n**Status**: opened on 2026-10-22.\n${entete}\n\n<!-- scope\nfiles:\n  - .drwil/ia-first.json\n-->\n`;
+  writeFileSync(join(racine, "docs", "projects", "couverture-root.md"), fiche("couverture", "**Garantie** : bloquante"));
+  writeFileSync(join(racine, "docs", "projects", "versioning.md"), fiche("versioning", "**Guarantee**: blocking"));
+  writeFileSync(join(racine, "docs", "projects", "montee.md"), fiche("montee", "**Garantie** : non bloquante"));
+  git("add", "-A");
+  git("commit", "-qm", "garanties");
+  assert.deepEqual(
+    scopedBriefs(racine).map((f) => f.path),
+    ["docs/projects/couverture-root.md", "docs/projects/versioning.md"],
+  );
+  assert.equal(blockingGuarantee("# x\n\n**Garantie** : bloquante\n"), true);
+  assert.equal(blockingGuarantee("# x\n\n**Maturité** : prêt\n"), false);
+  // Fiches de garantie retirées : la liste ordinaire revient.
+  git("rm", "-q", "docs/projects/couverture-root.md", "docs/projects/versioning.md");
+  git("commit", "-qm", "résolues");
+  assert.ok(scopedBriefs(racine).some((f) => f.path === FICHE));
+});
+
+test("QUA-188 : aucun lancement n'écrit plus auto_merge ; une marque héritée reste lisible, gardée jusqu'à CLOSING, effacée en SCOPING", () => {
+  const { racine } = depotCadre({ transitions: "agent" });
+  const agent = start(racine, FICHE);
+  assert.equal(agent.code, 0);
+  assert.equal(readState(racine).state.auto_merge, undefined, "lancement par l'agent");
+  assert.doesNotMatch(agent.message, /fusion automatique autorisée/);
+  rmSync(join(racine, ".drwil", "state.json"));
+  assert.equal(start(racine, FICHE, { human: true }).code, 0);
+  assert.equal(readState(racine).state.auto_merge, undefined, "lancement humain");
+  // Marque héritée : l'état reste valide et le rappel la dit encore (consigne de fusion, en français et en anglais).
+  let lu = { ...readState(racine), state: { ...readState(racine).state, auto_merge: true } };
+  assert.deepEqual(validateState(lu.state, racine), []);
+  assert.match(
+    context(lu, racine),
+    /mergeStateStatus.*BEHIND.*gh pr merge --auto --merge.*autoMergeRequest.*seulement ensuite revenir en SCOPING.*rester en CLOSING/s,
+  );
+  writeFileSync(join(racine, ".drwil", "ia-first.json"), JSON.stringify({ transitions: "agent", lang: "en" }));
+  assert.match(
+    context(lu, racine),
+    /mergeStateStatus.*BEHIND.*gh pr merge --auto --merge.*autoMergeRequest.*only then go back to SCOPING.*stay in CLOSING/s,
+  );
+  for (const vers of ["EVIDENCE", "VERIFY"]) {
+    const r = prepareTransition(lu, vers, { now: MAINTENANT }, racine);
+    assert.equal(r.state.auto_merge, true, vers);
+    lu = { ...lu, state: r.state };
+  }
+  assert.equal(
+    prepareTransition({ ...lu, state: { ...lu.state, activity: "CLOSING" } }, "SCOPING", { now: MAINTENANT }, racine).state.auto_merge,
+    undefined,
+  );
+});
+
+test("QUA-138 : avec la fusion automatique, le retour en SCOPING attend la fusion suivie par pr-watch ; verte sans fusion : relance, 30 minutes ; CI rouge : reopen ; délai dépassé : CLOSING signalé", () => {
+  const { racine } = depotCadre({ transitions: "agent" });
+  assert.equal(start(racine, FICHE, { human: true }).code, 0);
+  // Consigne de fusion lue sur une marque héritée (le lancement ne l'écrit plus, QUA-188).
+  const lu = { ...readState(racine), state: { ...readState(racine).state, activity: "CLOSING", auto_merge: true } };
+  // Chaque étape doit venir après la précédente : l'ancienne procédure revenait en SCOPING dès la
+  // programmation vérifiée, sans suivi ni fusion effective (PR #232).
+  const etapes = {
+    fr: [
+      "gh pr merge --auto --merge",
+      "`gh pr view --json autoMergeRequest`",
+      "suivre la PR par `node .githooks/pr-watch.mjs <numéro>`",
+      "relancé tant qu'il dit « verte » sans « fusionnée »",
+      "30 minutes au plus en tout",
+      "la PR fusionnée, seulement ensuite revenir en SCOPING",
+      "CI rouge avant la fusion : rester en CLOSING et rouvrir le chantier (`node .githooks/state.mjs reopen`",
+      "Délai dépassé, ou autre échec : rester en CLOSING et le signaler",
+    ],
+    en: [
+      "gh pr merge --auto --merge",
+      "`gh pr view --json autoMergeRequest`",
+      "follow the PR with `node .githooks/pr-watch.mjs <number>`",
+      "run again while it says « green » without « merged »",
+      "30 minutes at most in all",
+      "the PR merged, only then go back to SCOPING",
+      "Red CI before the merge: stay in CLOSING and reopen the workstream (`node .githooks/state.mjs reopen`",
+      "Time limit exceeded, or any other failure: stay in CLOSING and report it",
+    ],
+  };
+  for (const lang of ["fr", "en"]) {
+    writeFileSync(join(racine, ".drwil", "ia-first.json"), JSON.stringify({ transitions: "agent", lang }));
+    const texte = context(lu, racine);
+    let avant = -1;
+    for (const etape of etapes[lang]) {
+      const ici = texte.indexOf(etape, avant + 1);
+      assert.ok(ici > avant, `${lang} : « ${etape} » absent ou hors d'ordre`);
+      avant = ici;
+    }
+    // Aucun retour en SCOPING annoncé avant le suivi par pr-watch.
+    const suivi = texte.indexOf("pr-watch.mjs");
+    assert.doesNotMatch(texte.slice(0, suivi), /SCOPING/, `${lang} : SCOPING cité avant le suivi`);
+  }
+});
+
+test("validation : auto_merge booléenne, jamais vraie en SCOPING", () => {
+  const racine = depot();
+  assert.match(validateState(actif("BUILD", { auto_merge: "oui" }), racine)[0], /auto_merge/);
+  assert.match(validateState({ ...NEUTRAL_STATE, auto_merge: true }, racine)[0], /auto_merge/);
+  assert.deepEqual(validateState(actif("CLOSING", { auto_merge: true }), racine), []);
+});
+
+test("fiches cadrées : sans dossier de fiches, aucune", () => {
+  assert.deepEqual(scopedBriefs(tmp("drwil-etat-vide-")), []);
+});
+
+test("fiches cadrées : bloc cadrage commité, non terminée, hors modèles", () => {
+  const { racine } = depotCadre();
+  assert.deepEqual(
+    scopedBriefs(racine).map((f) => f.path),
+    [FICHE],
+  );
+  assert.equal(scopedBriefs(racine)[0].title, "Projet : Exemple");
+  // Un cadrage seulement dans l'arbre de travail ne compte pas : c'est le cadrage commité qui est validé.
+  writeFileSync(join(racine, "docs", "projects", "sans-cadrage.md"), "# Sans cadrage\n\n<!-- scope\nfiles:\n  - src/z.ts\n-->\n");
+  assert.deepEqual(
+    scopedBriefs(racine).map((f) => f.path),
+    [FICHE],
+  );
+});
+
+test("lancer : un geste humain passe directement en BUILD ; refusé à l'agent en mode humain", () => {
+  const { racine } = depotCadre();
+  const agent = start(racine, FICHE, { now: MAINTENANT });
+  assert.equal(agent.code, 1);
+  assert.match(agent.message, /décision humaine/);
+  assert.equal(readState(racine).source, "missing");
+  const ok = start(racine, FICHE, { human: true, now: MAINTENANT });
+  assert.equal(ok.code, 0, ok.message);
+  assert.deepEqual(readState(racine).state, {
+    version: 1,
+    activity: "BUILD",
+    active_brief: FICHE,
+    active_request: null,
+    since: MAINTENANT,
+    history: [{ activity: "BUILD", at: MAINTENANT }],
+  });
+  assert.match(start(racine, FICHE, { human: true }).message, /activité BUILD/, "pas de relance en pleine réalisation");
+});
+
+test("QUA-037 : lancer depuis CLOSING : seulement fiche supprimée et PR de clôture fusionnée ; la file est conservée", () => {
+  const { racine, git } = depotCadre();
+  const precedent = "docs/projects/precedent.md";
+  const principale = git("branch", "--show-current").stdout.trim();
+  const etat = (extra = {}) =>
+    writeFileSync(join(racine, ".drwil", "state.json"), JSON.stringify(actif("CLOSING", { active_brief: precedent, ...extra })));
+
+  // Sur la branche principale, fiche supprimée : le retour en SCOPING se fait seul, le lancement continue.
+  etat();
+  const ok = start(racine, FICHE, { human: true, now: MAINTENANT });
+  assert.equal(ok.code, 0, ok.message);
+  assert.match(ok.message, /CLOSING → BUILD/);
+  assert.equal(readState(racine).state.activity, "BUILD");
+  git("checkout", "-q", principale);
+  git("branch", "-q", "-D", "workstream/exemple");
+
+  // La fiche du chantier est encore là : pas de retour.
+  writeFileSync(join(racine, ".drwil", "state.json"), JSON.stringify(actif("CLOSING", { active_brief: "docs/projects/finie.md" })));
+  const encore = start(racine, FICHE, { human: true });
+  assert.equal(encore.code, 1);
+  assert.match(encore.message, /finie\.md est encore là/);
+  assert.equal(readState(racine).state.activity, "CLOSING");
+
+  // Branche de chantier non fusionnée : refus (gh ne répond pas dans ce dépôt de test).
+  etat();
+  git("checkout", "-qb", "chantier");
+  writeFileSync(join(racine, "ajout.txt"), "x");
+  git("add", "-A");
+  git("commit", "-qm", "travail");
+  const refus = start(racine, FICHE, { human: true });
+  assert.equal(refus.code, 1);
+  assert.match(refus.message, /fusion de la PR de clôture n'est pas établie/);
+  assert.equal(readState(racine).state.activity, "CLOSING");
+
+  // Branche fusionnée (classique) : le retour se fait.
+  git("checkout", "-q", principale);
+  git("merge", "-q", "--no-ff", "-m", "fusion", "chantier");
+  git("checkout", "-q", "chantier");
+  assert.equal(start(racine, FICHE, { human: true }).code, 0);
+  assert.equal(git("branch", "--show-current").stdout.trim(), "workstream/exemple");
+
+  // La file décidée est lancée par l'agent seul, depuis CLOSING aussi.
+  git("checkout", "-q", principale);
+  const suivante = "docs/projects/suivante.md";
+  writeFileSync(
+    join(racine, suivante),
+    "# Projet : suivante\n\n**Statut** : cadré le 2026-10-16.\n**Maturité** : prêt\n\n<!-- scope\nfiles:\n  - src/suivante.ts\n-->\n\n## Critères d'acceptation\n\n- Critère — `QUA-001`\n",
+  );
+  git("add", "-A");
+  git("commit", "-qm", "suivante");
+  etat({ queue: [suivante], queue_merge: false });
+  prouver(racine);
+  const agent = start(racine, suivante);
+  assert.equal(agent.code, 0, agent.message);
+  assert.equal(readState(racine).state.activity, "BUILD");
+});
+
+test("lancer : fiche non cadrée, terminée ou modèle refusée ; mode agent libre", () => {
+  const { racine } = depotCadre();
+  for (const f of ["docs/projects/sans-cadrage.md", "docs/projects/finie.md", "docs/projects/model-brief.md", "docs/projects/absente.md"]) {
+    assert.match(start(racine, f, { human: true }).message, /n'est pas une fiche cadrée/, f);
+  }
+  const agent = depotCadre({ transitions: "agent" }).racine;
+  assert.equal(start(agent, FICHE).code, 0);
+});
+
+// L'enfant relance ces mêmes fichiers : sans garde, il se relancerait sans fin.
+test("variables GIT_* du lanceur (commit -a, worktree) : les tests n'agissent jamais sur le dépôt qui les lance", {
+  skip: process.env.DRWIL_TESTS_ENFANT === "1",
+}, () => {
+  const victime = tmp("drwil-etat-victime-");
+  assert.equal(spawnSync("git", ["init", "-q", victime]).status, 0);
+  const config = readFileSync(join(victime, ".git", "config"), "utf8");
+  const ici = dirname(fileURLToPath(import.meta.url));
+  // NODE_TEST_CONTEXT, posé par node --test pour ses enfants : hérité, l'enfant ne lançait aucun test.
+  const { NODE_TEST_CONTEXT, ...env } = process.env;
+  const r = spawnSync(process.execPath, ["--test", join(ici, "state.test.mjs"), join(ici, "scope-gate.test.mjs")], {
+    encoding: "utf8",
+    env: { ...env, DRWIL_TESTS_ENFANT: "1", GIT_DIR: join(victime, ".git"), GIT_INDEX_FILE: join(victime, ".git", "index-du-hook") },
+  });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.notEqual(
+    spawnSync("git", ["rev-parse", "--verify", "-q", "HEAD"], { cwd: victime }).status,
+    0,
+    "un test a commité dans le dépôt lanceur",
+  );
+  assert.equal(readFileSync(join(victime, ".git", "config"), "utf8"), config, "un test a modifié la config du dépôt lanceur");
+});
+
+// --- Commande `node .githooks/state.mjs` (principal) et cas limites ---
+
+/** Exécute `fn` en capturant console.log et console.error. */
+async function capturer(fn) {
+  const sortie = [];
+  const erreurs = [];
+  const { log, error } = console;
+  console.log = (...m) => sortie.push(m.join(" "));
+  console.error = (...m) => erreurs.push(m.join(" "));
+  try {
+    const code = await fn();
+    return { code, sortie: sortie.join("\n"), erreurs: erreurs.join("\n") };
+  } finally {
+    Object.assign(console, { log, error });
+  }
+}
+
+/**
+ * Simule un terminal interactif : chaque invite (écriture se terminant par « : ») reçoit la
+ * réponse suivante. Rend aussi les invites vues.
+ */
+async function avecTerminal(reponses, fn) {
+  const entree = new PassThrough();
+  entree.isTTY = true;
+  const descripteur = Object.getOwnPropertyDescriptor(process, "stdin");
+  Object.defineProperty(process, "stdin", { value: entree, configurable: true });
+  const { isTTY } = process.stdout;
+  const ecrire = process.stdout.write;
+  const invites = [];
+  process.stdout.isTTY = true;
+  process.stdout.write = (morceau, ...reste) => {
+    const texte = String(morceau);
+    if (/: $/.test(texte)) {
+      invites.push(texte);
+      setImmediate(() => entree.write(`${reponses.shift() ?? ""}\n`));
+      return true;
+    }
+    return ecrire.call(process.stdout, morceau, ...reste);
+  };
+  try {
+    return { ...(await fn()), invites };
+  } finally {
+    process.stdout.write = ecrire;
+    process.stdout.isTTY = isTTY;
+    Object.defineProperty(process, "stdin", descripteur);
+  }
+}
+
+test("principal fiches : liste lisible, JSON, ou aucune fiche", async () => {
+  const { racine } = depotCadre();
+  let r = await capturer(() => main(["briefs"], racine));
+  assert.equal(r.code, 0);
+  assert.equal(r.sortie, `1. ${FICHE} — Projet : Exemple`);
+  r = await capturer(() => main(["briefs", "--json"], racine));
+  assert.equal(JSON.parse(r.sortie)[0].path, FICHE);
+  r = await capturer(() => main(["briefs"], depot()));
+  assert.match(r.sortie, /^\(aucune fiche cadrée/);
+  r = await capturer(() => main(["briefs"], depot({ lang: "en" })));
+  assert.match(r.sortie, /^\(no scoped brief/, "ligne de commande en anglais");
+});
+
+test("principal lancer sans terminal : refusé en mode humain, lancé en mode agent (avec --request)", async () => {
+  const humain = depotCadre().racine;
+  let r = await capturer(() => main(["start", FICHE], humain));
+  assert.equal(r.code, 1);
+  assert.match(r.erreurs, /^✗ lancement refusé : c'est une décision humaine/);
+  const agent = depotCadre({ transitions: "agent" }).racine;
+  r = await capturer(() => main(["start", FICHE, "--request", "faire X"], agent));
+  assert.equal(r.code, 0, r.erreurs);
+  // La fiche d'exemple n'a pas de critère : lancée avec un avertissement (newRequirements non imposé, QUA-021).
+  assert.match(
+    r.sortie,
+    /^✓ Branche créée : workstream\/exemple \(depuis \w+\)\.\nSCOPING → BUILD \(lancé : docs\/projects\/exemple\.md\)\navertissement : la fiche « docs\/projects\/exemple\.md » n'a aucun critère[^\n]*\n\n\[drwil\] État de gouvernance/,
+  );
+  assert.equal(readState(agent).state.active_request, "faire X");
+  // --request sans valeur : ignoré.
+  const autre = depotCadre({ transitions: "agent" }).racine;
+  await capturer(() => main(["start", FICHE, "--request"], autre));
+  assert.equal(readState(autre).state.active_request, null);
+});
+
+test("principal lancer au terminal : l'humain choisit et confirme, sans question de fusion (QUA-037)", async () => {
+  const { racine, git } = depotCadre();
+  writeFileSync(
+    join(racine, "docs", "projects", "bloquee.md"),
+    "# Bloquée\n\n**Statut** : cadré le 2026-10-10.\n**Maturité** : à affiner\n\n<!-- scope\nfiles:\n  - src/b.ts\n-->\n\n## Points à trancher\n\n- [décision] A ou B ?\n",
+  );
+  git("add", "-A");
+  git("commit", "-qm", "bloquee");
+  const r = await avecTerminal(["1", "START", ""], () => capturer(() => main(["start"], racine)));
+  assert.equal(r.code, 0, r.erreurs);
+  assert.match(
+    r.sortie,
+    /^1\. docs\/projects\/exemple\.md — Projet : Exemple \[P2\]\n2\. docs\/projects\/bloquee\.md — Bloquée \[P2 · non prête : 1 décision\(s\) à trancher · à affiner : à revoir avant de la lancer\]/,
+  );
+  // Choix, confirmation, worktree : plus de « Retapez MERGE », la fusion automatique est le comportement par défaut.
+  assert.deepEqual(r.invites.length, 3);
+  assert.ok(!r.invites.some((i) => /MERGE/.test(i)), "plus de question de fusion");
+  assert.equal(readState(racine).state.auto_merge, undefined, "aucune marque de fusion écrite (QUA-188)");
+  assert.equal(readState(racine).state.queue_merge, undefined);
+});
+
+test("QUA-205 : principal lancer au terminal : la réponse WORKTREE lance le chantier dans un worktree frère", async () => {
+  const { racine } = depotCadre();
+  const r = await avecTerminal(["START", "WORKTREE"], () => capturer(() => main(["start", FICHE], racine)));
+  const dossier = `${racine}-exemple`;
+  try {
+    assert.equal(r.code, 0, r.erreurs);
+    assert.equal(r.invites.length, 2);
+    assert.equal(existsSync(join(dossier, ".git")), true);
+    assert.equal(readState(dossier).state.activity, "BUILD");
+    assert.equal(readState(racine).state.activity, "SCOPING");
+  } finally {
+    rmSync(dossier, { recursive: true, force: true });
+  }
+});
+
+test("principal lancer au terminal : sans confirmation exacte ou numéro inconnu, rien ne change", async () => {
+  const { racine } = depotCadre();
+  let r = await avecTerminal(["oui"], () => capturer(() => main(["start", FICHE], racine)));
+  assert.equal(r.code, 1);
+  assert.equal(r.erreurs, "✗ lancement non confirmé : état inchangé");
+  r = await avecTerminal(["9"], () => capturer(() => main(["start"], racine)));
+  assert.equal(r.code, 1);
+  assert.equal(r.invites.length, 1);
+  r = await avecTerminal(["START", "", ""], () => capturer(() => main(["start", FICHE], racine)));
+  assert.equal(r.code, 0, r.erreurs);
+  assert.equal(readState(racine).state.auto_merge, undefined);
+});
+
+test("principal rappel : affiché seulement quand l'état change", async () => {
+  const racine = depot();
+  assert.match((await capturer(() => main(["reminder"], racine))).sortie, /^\[drwil\] Rappel/);
+  assert.equal((await capturer(() => main(["reminder"], racine))).sortie, "");
+});
+
+test("QUA-065 : principal copilot-start : l'état en JSON natif Copilot, jamais d'échec", async () => {
+  const racine = depot();
+  const r = await capturer(() => main(["copilot-start"], racine));
+  assert.match(JSON.parse(r.sortie).additionalContext, /SCOPING/);
+  assert.deepEqual(JSON.parse((await capturer(() => main(["copilot-start"], null))).sortie), {});
+});
+
+test("QUA-065 : principal copilot-message : rappel devant le message, une seule fois, jamais bloquant", async () => {
+  const racine = depot();
+  const entree = (texte) => Readable.from([texte]);
+  const message = JSON.stringify({ prompt: "p", transformedPrompt: "bonjour" });
+  const r = JSON.parse((await capturer(() => main(["copilot-message"], racine, entree(message)))).sortie);
+  assert.match(r.modifiedTransformedPrompt, /^\[drwil\] Rappel[\s\S]*\n\nbonjour$/);
+  const encore = await capturer(() => main(["copilot-message"], racine, entree(message)));
+  assert.deepEqual(JSON.parse(encore.sortie), {}, "inchangé : rien");
+  for (const brut of ["", "pas du json", JSON.stringify({ prompt: "p" })])
+    assert.deepEqual(JSON.parse((await capturer(() => main(["copilot-message"], racine, entree(brut)))).sortie), {});
+});
+
+test("QUA-067 : principal gemini-start et gemini-message : l'état et le rappel en JSON natif Gemini, une seule fois, jamais d'échec", async () => {
+  const racine = depot();
+  const debut = JSON.parse((await capturer(() => main(["gemini-start"], racine))).sortie).hookSpecificOutput;
+  assert.equal(debut.hookEventName, "SessionStart");
+  assert.match(debut.additionalContext, /SCOPING/);
+  const message = JSON.parse((await capturer(() => main(["gemini-message"], racine))).sortie).hookSpecificOutput;
+  assert.equal(message.hookEventName, "BeforeAgent");
+  assert.match(message.additionalContext, /^\[drwil\] Rappel/);
+  assert.deepEqual(JSON.parse((await capturer(() => main(["gemini-message"], racine))).sortie), {}, "inchangé : rien");
+  for (const mode of ["gemini-start", "gemini-message"])
+    assert.deepEqual(JSON.parse((await capturer(() => main([mode], null))).sortie), {});
+});
+
+test("QUA-065 : readStdinJson : rend le JSON dès qu'il est complet, sans attendre la fin ni plus que le délai", async () => {
+  const ouvert = new PassThrough();
+  ouvert.write('{"a":1}');
+  assert.deepEqual(await readStdinJson(ouvert, 5000), { a: 1 });
+  const muet = new PassThrough();
+  // Aucune mesure de durée : un flux qui ne se ferme jamais ne rend null que par le délai, sinon le test n'aboutit pas.
+  assert.equal(await readStdinJson(muet, 50), null);
+  const coupe = new PassThrough();
+  coupe.write("{ incomplet");
+  coupe.end();
+  assert.equal(await readStdinJson(coupe, 5000), null);
+});
+
+test("principal rappel et lecture : une racine inutilisable ne casse jamais la session", async () => {
+  assert.deepEqual(await capturer(() => main(["reminder"], null)), { code: 0, sortie: "", erreurs: "" });
+  const r = await capturer(() => main([], null));
+  assert.equal(r.code, 0);
+  assert.match(r.sortie, /^\[drwil\] état de gouvernance illisible : /);
+});
+
+test("rappel court en anglais, fiche active", () => {
+  const racine = depot({ state: actif("BUILD"), lang: "en" });
+  assert.match(shortReminder(readState(racine), racine), /^\[drwil\] Reminder: BUILD · docs\/projects\/exemple\.md · scope: 2 file\(s\)/);
+  const neutre = depot({ lang: "en" });
+  assert.match(shortReminder(readState(neutre), neutre), /^\[drwil\] Reminder: SCOPING · no active brief \(read again/);
+});
+
+test("principal lecture : contexte ou JSON", async () => {
+  const racine = depot({ state: actif("BUILD") });
+  assert.match((await capturer(() => main([], racine))).sortie, /^\[drwil\] État de gouvernance/);
+  assert.equal(JSON.parse((await capturer(() => main(["--json"], racine))).sortie).state.activity, "BUILD");
+});
+
+test("principal passer : usage sans activité, transition écrite ou refusée, confirmation au terminal", async () => {
+  const racine = depot({ config: { transitions: "agent" } });
+  for (const args of [["move"], ["move", "--brief"]]) {
+    const r = await capturer(() => main(args, racine));
+    assert.equal(r.code, 2);
+    assert.match(r.erreurs, /^usage : node \.githooks\/state\.mjs move </);
+  }
+  let r = await capturer(() => main(["move", "EXPECTATION", "--brief", FICHE, "--request", "d"], racine));
+  assert.equal(r.code, 0, r.erreurs);
+  assert.match(r.sortie, /^✓ /);
+  r = await capturer(() => main(["move", "CLOSING"], racine));
+  assert.equal(r.code, 1);
+  assert.match(r.erreurs, /^✗ /);
+  const humain = depot();
+  r = await avecTerminal(["EXPECTATION"], () => capturer(() => main(["move", "EXPECTATION", "--brief", FICHE], humain)));
+  assert.equal(r.code, 0, r.erreurs);
+  assert.equal(readState(humain).state.activity, "EXPECTATION");
+});
+
+test("QUA-044 : ligne de commande : node state.mjs lit l'état de sa racine (DRWIL_ROOT en test), jamais du dossier courant", () => {
+  const racine = depot();
+  const sous = join(racine, "sous");
+  mkdirSync(sous, { recursive: true });
+  const r = spawnSync(process.execPath, [fileURLToPath(new URL("./state.mjs", import.meta.url))], {
+    cwd: sous,
+    encoding: "utf8",
+    env: { ...process.env, DRWIL_ROOT: racine },
+  });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /Activité : SCOPING/);
+  assert.ok(!existsSync(join(sous, ".drwil")), "rien d'écrit dans le dossier courant");
+  const url = pathToFileURL(join(tmpdir(), "projet", ".githooks", "state.mjs")).href;
+  assert.equal(stateRoot(url, {}), join(tmpdir(), "projet"), "sans DRWIL_ROOT : le parent de .githooks/");
+  assert.equal(stateRoot(url, { DRWIL_ROOT: racine }), racine);
+});
+
+test("cas limites : attente non textuelle, verdict inconnu, configuration « null »", () => {
+  assert.deepEqual(validateState(actif("BUILD", { active_brief: 5 }), depot()), ["active_brief : chemin de fiche ou null attendu"]);
+  const { racine, evidence } = depotEnVerify();
+  evidence("verify-2026-10-09T10-00-00-000Z.json", { status: "bizarre" });
+  assert.match(verifyEvidence(racine).reason, /sans verdict reconnu/);
+  const nulle = depot();
+  writeFileSync(join(nulle, ".drwil", "ia-first.json"), "null");
+  assert.match(context(readState(nulle), nulle), /Activité : SCOPING/);
+});
+
+test("fiche active sans titre, ou illisible (un dossier) : contexte et rappel tiennent", () => {
+  const sansTitre = depot({ state: actif("BUILD"), fiche: false });
+  writeFileSync(join(sansTitre, FICHE), "**Statut** : cadré le 2026-10-09.\n");
+  assert.match(context(readState(sansTitre), sansTitre), /Attente active : docs\/projects\/exemple\.md\n/);
+  const dossier = depot({ state: actif("BUILD"), fiche: false });
+  mkdirSync(join(dossier, FICHE));
+  assert.match(context(readState(dossier), dossier), /\(aucun bloc scope/);
+  assert.match(shortReminder(readState(dossier), dossier), /périmètre : 0 fichier/);
+});
+
+test("rappel : empreinte impossible à écrire, le rappel est quand même rendu", () => {
+  const racine = depot();
+  mkdirSync(join(racine, ".drwil", "reminder.json"));
+  assert.match(reminderIfChanged(racine), /^\[drwil\] Rappel/);
+});
+
+test("fiches cadrées : index réglé, fiche sans titre ; lancer sans fiche ou avec une demande invalide", () => {
+  const { racine, git } = depotCadre({ dirs: { index: "suivi/index.md" }, transitions: "agent" });
+  mkdirSync(join(racine, "suivi"));
+  writeFileSync(join(racine, "suivi", "index.md"), "- [ ] [IA] [P0] `docs/projects/sans-titre.md`\n");
+  writeFileSync(
+    join(racine, "docs", "projects", "sans-titre.md"),
+    "**Statut** : cadré le 2026-10-10.\n\n<!-- scope\nfiles:\n  - src/t.ts\n-->\n",
+  );
+  git("add", "-A");
+  git("commit", "-qm", "index");
+  const sansTitre = scopedBriefs(racine).find((f) => f.path === "docs/projects/sans-titre.md");
+  assert.deepEqual([sansTitre.title, sansTitre.priority], ["docs/projects/sans-titre.md", "P0"]);
+  assert.match(start(racine, undefined).message, /« undefined » n'est pas une fiche cadrée/);
+  assert.match(start(racine, FICHE, { request: 5 }).message, /^lancement refusé : active_request : chaîne ou null attendu/);
+});
+
+/** Un dépôt avec trois fiches cadrées : a et b prêtes (maturité, critères), c sans critère. */
+function depotFile(config = {}) {
+  const racine = depot({ fiche: false, config });
+  const fiche = (nom, pret) =>
+    writeFileSync(
+      join(racine, "docs", "projects", `${nom}.md`),
+      `# Projet : ${nom}\n\n**Statut** : cadré le 2026-10-16.\n${pret ? "**Maturité** : prêt\n" : ""}\n<!-- scope\nfiles:\n  - src/${nom}.ts\n-->\n\n${pret ? `## Critères d'acceptation\n\n- Critère ${nom} — \`QUA-001\`\n` : ""}`,
+    );
+  fiche("a", true);
+  fiche("b", true);
+  fiche("c", false);
+  writeFileSync(join(racine, ".gitignore"), ".drwil/\n");
+  const git = (...args) => spawnSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: racine, encoding: "utf8" });
+  git("init", "-q");
+  git("add", "-A");
+  git("commit", "-qm", "init");
+  return racine;
+}
+const [A, B, C] = ["a", "b", "c"].map((n) => `docs/projects/${n}.md`);
+const ecrireEtat = (racine, etat) => writeFileSync(join(racine, ".drwil", "state.json"), JSON.stringify(etat));
+/** La preuve qu'écrit pr-watch après la fusion (QUA-251) : CI de la branche principale verte sur son sommet. */
+const prouver = (racine) => writeProof(racine, { pr: 1, sha: mainTip(racine), run: { databaseId: 1, url: "u" } });
+
+test("QUA-037 : un geste humain enregistre une file de fiches prêtes, sans marque de fusion ; une fiche non prête la refuse entière", () => {
+  const racine = depotFile();
+  const r = start(racine, A, { human: true, queue: [B] });
+  assert.equal(r.code, 0, r.message);
+  assert.match(r.message, /file : ensuite docs\/projects\/b\.md/);
+  assert.deepEqual(readState(racine).state.queue, [B]);
+  // La fusion automatique est le comportement par défaut (QUA-188) : `queue_merge` n'est plus écrit.
+  assert.equal(readState(racine).state.queue_merge, undefined);
+  const refus = depotFile();
+  assert.match(start(refus, A, { human: true, queue: [C] }).message, /« docs\/projects\/c\.md » ne peut pas entrer dans une file/);
+  assert.equal(readState(refus).source, "missing", "rien n'est écrit");
+  assert.equal(start(depotFile(), C, { human: true }).code, 0, "sans file, une fiche non prête se lance comme avant");
+});
+
+test("QUA-037 : une file se construit par réponses à choix unique : une fiche ajoutée à chaque fois, rien n'est lancé avant « terminer »", () => {
+  const racine = depotFile();
+  assert.equal(draftFinish(racine).code, 1, "file vide : rien à lancer");
+  assert.equal(draftAdd(racine, A).code, 0);
+  assert.equal(readState(racine).state.activity, "SCOPING", "ajouter ne lance rien");
+  const r = draftAdd(racine, B);
+  assert.match(r.message, /file en construction : docs\/projects\/b\.md ajoutée, soit docs\/projects\/a\.md, docs\/projects\/b\.md/);
+  assert.match(draftAdd(racine, B).message, /y est déjà/);
+  assert.match(
+    context(readState(racine), racine),
+    /File en construction par sondages enchaînés \(QUA-037\) : docs\/projects\/a\.md, docs\/projects\/b\.md/,
+  );
+  const fin = draftFinish(racine);
+  assert.equal(fin.code, 0, fin.message);
+  const etat = readState(racine).state;
+  assert.equal(etat.active_brief, A);
+  assert.deepEqual(etat.queue, [B]);
+  assert.equal(etat.queue_merge, undefined, "plus de marque de fusion écrite (QUA-188)");
+  assert.equal(etat.queue_draft, undefined, "la file en construction disparaît au lancement");
+  assert.match(draftAdd(racine, B).message, /elle se construit en SCOPING/);
+});
+
+test("QUA-037 : une fiche non prête, absente ou déjà en file d'attente est refusée à l'ajout ; l'abandon vide la file en construction", () => {
+  const racine = depotFile();
+  assert.match(draftAdd(racine, C).message, /« docs\/projects\/c\.md » ne peut pas entrer dans une file/);
+  assert.match(draftAdd(racine, "docs/projects/absente.md").message, /absente\.md/);
+  assert.equal(readState(racine).source, "missing", "rien n'est écrit");
+  draftAdd(racine, A);
+  assert.match(stopQueue(racine).message, /file en construction abandonnée : docs\/projects\/a\.md/);
+  assert.equal(readState(racine).state.queue_draft, undefined);
+  writeState(racine, { ...NEUTRAL_STATE, queue: [B] });
+  assert.match(draftAdd(racine, A).message, /une file attend déjà/);
+  assert.deepEqual(validateState({ ...NEUTRAL_STATE, activity: "BUILD", active_brief: A, queue_draft: [B] }, racine).length, 1);
+  assert.deepEqual(validateState({ ...NEUTRAL_STATE, queue_draft: "x" }, racine), ["queue_draft : liste de fiches attendue"]);
+  assert.match(draftAdd(depotFile(), undefined).message, /undefined|introuvable|cadrée/i);
+  const invalide = depotFile();
+  ecrireEtat(invalide, { version: 1, activity: "SCOPING", active_brief: null, active_request: null, since: "pas une date" });
+  assert.match(draftAdd(invalide, A).message, /elle se construit en SCOPING.*since/);
+  assert.match(draftFinish(invalide).message, /elle se construit en SCOPING/);
+});
+
+test("QUA-037 : après clôture la file reste, l'agent lance seul sa tête ; une marque de fusion héritée n'est pas recopiée ; hors file ou hors SCOPING, refusé", () => {
+  const racine = depotFile();
+  ecrireEtat(racine, {
+    version: 1,
+    activity: "CLOSING",
+    active_brief: C,
+    active_request: null,
+    since: null,
+    auto_merge: true,
+    queue: [B, A],
+    queue_merge: true,
+  });
+  const p = prepareTransition(readState(racine), "SCOPING", { now: MAINTENANT }, racine);
+  // État ancien avec `queue_merge` : valide, lu, mais plus recopié (QUA-188).
+  assert.deepEqual(p.state, { ...NEUTRAL_STATE, since: MAINTENANT, queue: [B, A], history: [{ activity: "SCOPING", at: MAINTENANT }] });
+  ecrireEtat(racine, p.state);
+  assert.match(start(racine, C).message, /décision humaine/, "fiche hors file");
+  prouver(racine);
+  const r = start(racine, B, { now: MAINTENANT });
+  assert.equal(r.code, 0, r.message);
+  assert.deepEqual(readState(racine).state, {
+    version: 1,
+    activity: "BUILD",
+    active_brief: B,
+    active_request: null,
+    since: MAINTENANT,
+    queue: [A],
+    history: [{ activity: "BUILD", at: MAINTENANT }],
+  });
+  assert.match(start(racine, B).message, /activité BUILD/, "pas de relance en pleine réalisation");
+  const abandon = depotFile();
+  ecrireEtat(abandon, {
+    version: 1,
+    activity: "BUILD",
+    active_brief: A,
+    active_request: null,
+    since: null,
+    queue: [B],
+    queue_merge: false,
+  });
+  assert.equal(
+    prepareTransition(readState(abandon), "SCOPING", { now: MAINTENANT }, abandon).state.queue,
+    undefined,
+    "abandon : file perdue",
+  );
+});
+
+test("QUA-037 : arrêter la file ; commandes next et queue stop ; contexte et état invalide, en anglais aussi", async () => {
+  const racine = depotFile();
+  ecrireEtat(racine, { version: 1, activity: "BUILD", active_brief: A, active_request: null, since: null, queue: [B], queue_merge: true });
+  // queue_merge hérité : plus dit, la fusion automatique est le comportement par défaut pour toute la file (QUA-163).
+  assert.match(context(readState(racine), racine), /File décidée au lancement : ensuite docs\/projects\/b\.md\. /);
+  let r = await capturer(() => main(["queue", "stop"], racine));
+  assert.equal(r.code, 0);
+  assert.match(r.sortie, /file arrêtée : docs\/projects\/b\.md ne seront pas lancés/);
+  assert.equal(readState(racine).state.queue, undefined);
+  assert.match(stopQueue(racine).message, /aucune file en cours/);
+  const suivante = depotFile();
+  ecrireEtat(suivante, { version: 1, activity: "SCOPING", active_brief: null, active_request: null, since: null, queue: [A] });
+  prouver(suivante);
+  r = await capturer(() => main(["next"], suivante));
+  assert.equal(r.code, 0, r.sortie);
+  assert.equal(readState(suivante).state.active_brief, A);
+  r = await capturer(() => main(["next"], depotFile()));
+  assert.equal(r.code, 1, "sans file, rien à lancer");
+  const anglais = depotFile({ lang: "en" });
+  ecrireEtat(anglais, { version: 1, activity: "BUILD", active_brief: A, active_request: null, since: null, queue: [B] });
+  assert.match(context(readState(anglais), anglais), /Queue decided at start: then docs\/projects\/b\.md\. With Claude Code/);
+  assert.match(
+    start(depotFile({ lang: "en" }), A, { human: true, queue: [C] }).message,
+    /^start refused: "docs\/projects\/c\.md" cannot enter a queue/,
+  );
+  assert.deepEqual(validateState({ ...NEUTRAL_STATE, queue: "x", queue_merge: 1 }, anglais), [
+    "queue: list of briefs expected",
+    "queue_merge: boolean expected",
+  ]);
+  assert.match(validateState({ ...NEUTRAL_STATE, queue: ["docs/projects/absente.md"] }, racine).join(), /absente\.md/);
+});
+
+test("QUA-037 : une file se mène un sous-agent par chantier ; reprise confirmée par l'humain ; hors file, /clear proposé à la clôture", () => {
+  const etat = (racine, activity, extra = {}) => {
+    ecrireEtat(racine, {
+      version: 1,
+      activity,
+      active_brief: activity === "SCOPING" ? null : A,
+      active_request: null,
+      since: null,
+      ...extra,
+    });
+    return context(readState(racine), racine);
+  };
+  const racine = depotFile();
+  const enFile = etat(racine, "BUILD", { queue: [B], queue_merge: true });
+  assert.match(enFile, /Avec Claude Code, chaque chantier de la file se mène dans un sous-agent \(contexte neuf\)/);
+  assert.match(enFile, /sa consigne commence par lire l'état \(`node \.githooks\/state\.mjs`\)/);
+  assert.match(enFile, /jamais dans une copie isolée/, "l'état .drwil/state.json, ignoré par Git, n'y est pas");
+  assert.match(enFile, /la session principale ne garde que leurs comptes rendus/);
+  assert.match(enFile, /Autre outil : un sous-agent seulement si l'outil en offre un/);
+  assert.match(enFile, /proposer à l'humain d'ouvrir une nouvelle conversation pour la suivante/);
+  assert.doesNotMatch(enFile, /tout dans la même session/);
+  assert.match(enFile, /suit la PR par `gh` jusqu'à la fusion, 30 minutes au plus/);
+  assert.match(enFile, /jamais de suivante sur une fusion non faite/);
+  assert.match(enFile, /délai de fusion dépassé/);
+  assert.doesNotMatch(enFile, /je lance \?/, "pas de reprise à confirmer pendant un chantier");
+  const reprise = etat(racine, "SCOPING", { queue: [B] });
+  assert.match(reprise, /« la file reprend avec docs\/projects\/b\.md : je lance \? »/);
+  assert.match(reprise, /ne lancer `node \.githooks\/state\.mjs next` que sur un oui explicite/);
+  const horsFile = etat(racine, "CLOSING");
+  assert.match(horsFile, /Hors file : terminer en proposant à l'humain `\/clear` avant sa prochaine demande/);
+  assert.doesNotMatch(etat(racine, "CLOSING", { queue: [B] }), /proposant à l'humain `\/clear`/, "en file, la session continue");
+  assert.doesNotMatch(etat(racine, "BUILD"), /\/clear/);
+  const anglais = depotFile({ lang: "en" });
+  assert.match(
+    etat(anglais, "BUILD", { queue: [B] }),
+    /With Claude Code, each workstream of the queue runs in a subagent \(fresh context\)/,
+  );
+  assert.match(etat(anglais, "SCOPING", { queue: [B] }), /« the queue resumes with docs\/projects\/b\.md: shall I start it\? »/);
+  assert.match(etat(anglais, "CLOSING"), /Outside a queue: finish by suggesting `\/clear` to the human/);
+});
+
+const enParallele = (racine) => {
+  ecrireEtat(racine, { version: 1, activity: "SCOPING", active_brief: null, active_request: null, since: null, parallel: [A, B] });
+  return context(readState(racine), racine);
+};
+
+test("QUA-148 : en file parallèle, un sous-agent par worktree, comptes rendus seuls, une PR suivie par chantier ; rien hors file parallèle", () => {
+  const texte = enParallele(depotFile());
+  assert.match(texte, /File en parallèle décidée au lancement : docs\/projects\/a\.md, docs\/projects\/b\.md/);
+  assert.match(texte, /la session principale n'en crée aucun/);
+  assert.match(texte, /dont le dossier de travail est son worktree/);
+  assert.match(texte, /jamais `isolation: "worktree"`/);
+  assert.match(texte, /sa consigne commence par lire l'état dans ce dossier/);
+  assert.match(texte, /la session principale ne garde que leurs comptes rendus/);
+  assert.match(texte, /suit chaque PR par `gh` jusqu'à la fusion, 30 minutes au plus chacune, sans attendre la fusion d'un autre chantier/);
+  assert.match(texte, /le sous-agent rebase et résout seul/);
+  const anglais = enParallele(depotFile({ lang: "en" }));
+  assert.match(anglais, /Parallel queue decided at start: docs\/projects\/a\.md, docs\/projects\/b\.md/);
+  assert.match(anglais, /whose working folder is its worktree/);
+  assert.match(anglais, /the main session keeps only their reports/);
+  assert.match(anglais, /the subagent rebases and resolves it alone/);
+  assert.doesNotMatch(context(readState(depotFile()), depotFile()), /File en parallèle/);
+});
+
+test("QUA-149 : en file parallèle, le chantier qui demande un humain arrête son seul sous-agent, rien n'est relancé, le bilan dit l'état de chacun", () => {
+  const texte = enParallele(depotFile());
+  assert.match(
+    texte,
+    /Un chantier qui demande un humain \(attestation, FAIL non corrigé, CI rouge, délai de fusion dépassé, décision à prendre\)/,
+  );
+  assert.match(texte, /arrête son sous-agent en disant pourquoi et ce qui est attendu/);
+  assert.match(texte, /les autres continuent et la session principale ne lance rien de plus d'elle-même/);
+  assert.match(texte, /un bilan de file en fin : l'état de chaque chantier \(worktree, branche, fiche, activité, PR\)/);
+  const anglais = enParallele(depotFile({ lang: "en" }));
+  assert.match(anglais, /stops its own subagent, saying why and what is expected/);
+  assert.match(anglais, /the others go on and the main session starts nothing more by itself/);
+  assert.match(anglais, /the state of each workstream \(worktree, branch, brief, activity, PR\)/);
+});
+
+test("QUA-131 : revenu en SCOPING après une clôture, le rappel invite à une nouvelle session, pour tout outil ; la file garde son sous-agent", async () => {
+  const racine = depotFile();
+  ecrireEtat(racine, { version: 1, activity: "CLOSING", active_brief: A, active_request: null, since: "2026-10-24T10:00:00Z" });
+  const r = await move(racine, { to: "SCOPING" });
+  assert.equal(r.code, 0, r.message);
+  const apres = context(readState(racine), racine);
+  assert.match(
+    apres,
+    /Après une clôture, le chantier suivant se lance dans une nouvelle session \(Claude Code : `\/clear` ; autre outil : une nouvelle conversation\) — un contexte neuf ne relit pas le chantier clos/,
+  );
+  assert.match(apres, /Une file garde son sous-agent par chantier\./);
+  writeFileSync(
+    join(racine, ".drwil", "state.json"),
+    JSON.stringify({ ...JSON.parse(readFileSync(join(racine, ".drwil", "state.json"), "utf8")), since: null }),
+  );
+  assert.doesNotMatch(context(readState(racine), racine), /nouvelle session/, "état neutre (aucun retour) : rien");
+  ecrireEtat(racine, {
+    version: 1,
+    activity: "SCOPING",
+    active_brief: null,
+    active_request: null,
+    since: "2026-10-24T10:00:00Z",
+    queue: [B],
+  });
+  const enFile = context(readState(racine), racine);
+  assert.doesNotMatch(enFile, /Après une clôture/, "en file, la reprise de file parle");
+  assert.match(enFile, /chaque chantier de la file se mène dans un sous-agent/, "la file garde son sous-agent par chantier");
+  ecrireEtat(racine, { version: 1, activity: "BUILD", active_brief: A, active_request: null, since: "2026-10-24T10:00:00Z" });
+  assert.doesNotMatch(context(readState(racine), racine), /nouvelle session/);
+  const anglais = depotFile({ lang: "en" });
+  ecrireEtat(anglais, { version: 1, activity: "SCOPING", active_brief: null, active_request: null, since: "2026-10-24T10:00:00Z" });
+  assert.match(
+    context(readState(anglais), anglais),
+    /After a closing, the next workstream starts in a new session \(Claude Code: `\/clear`; another tool: a new conversation\).*A queue keeps its subagent per workstream\./,
+  );
+});
+
+const DETOUR = { origin_brief: "docs/projects/chantier.md", origin_branch: "chantier/x", branch: "detour/d", stash: null };
+
+test("QUA-050 : un détour se valide — forme, BUILD seul, fiches du détour et du chantier qui peuvent manquer", () => {
+  const racine = depot();
+  const enDetour = (detour, activite = "BUILD", fiche = "docs/projects/detour-d.md") =>
+    validateState(actif(activite, { active_brief: fiche, detour }), racine);
+  assert.deepEqual(enDetour(DETOUR), [], "fiche du détour supprimée par sa PR, fiche du chantier absente de la branche du détour");
+  assert.deepEqual(enDetour({ ...DETOUR, stash: "abc", human: true }), []);
+  for (const mauvais of [
+    null,
+    "x",
+    { ...DETOUR, origin_branch: "" },
+    { ...DETOUR, branch: 1 },
+    { ...DETOUR, stash: 3 },
+    { ...DETOUR, stash: "" },
+    { ...DETOUR, human: "oui" },
+  ])
+    assert.deepEqual(enDetour(mauvais), ["detour : objet { origin_brief, origin_branch, branch, stash, human? } attendu"]);
+  assert.deepEqual(enDetour(DETOUR, "EVIDENCE"), ["detour : seulement en BUILD"]);
+  assert.match(enDetour({ ...DETOUR, origin_brief: "ailleurs/x.md" })[0], /active_brief : fiche \.md de docs\/projects\/ attendue/);
+  assert.match(
+    validateState(actif("BUILD", { active_brief: "docs/projects/absente.md" }), racine)[0],
+    /introuvable/,
+    "hors détour, la fiche doit exister",
+  );
+  assert.deepEqual(validateState(actif("BUILD", { detour: DETOUR }), racine), [], "fiche du chantier présente : valide aussi");
+  assert.deepEqual(validateState(actif("BUILD", { active_brief: "docs/projects/detour-d.md", detour: null }), depot({ lang: "en" })), [
+    "detour: object { origin_brief, origin_branch, branch, stash, human? } expected",
+  ]);
+  assert.deepEqual(validateState(actif("VERIFY", { detour: DETOUR }), depot({ lang: "en" })), ["detour: only in BUILD"]);
+});
+
+test("QUA-050 : en détour, aucune transition sauf l'abandon en SCOPING ; l'état ne s'écrit que par setDetour, jamais invalide", async () => {
+  const racine = depot({ state: actif("BUILD", { detour: DETOUR }) });
+  const r = await move(racine, { to: "EVIDENCE" });
+  assert.equal(r.code, 1);
+  assert.match(r.message, /détour en cours : le reprendre d'abord \(`node \.githooks\/detour\.mjs resume`\)/);
+  const en = depot({ lang: "en", state: actif("BUILD", { detour: DETOUR }) });
+  assert.match((await move(en, { to: "EVIDENCE" })).message, /detour in progress: resume it first/);
+  assert.equal((await move(racine, { to: "SCOPING" })).code, 0);
+  assert.deepEqual(readState(racine).state.detour, undefined);
+
+  const autre = depot({ state: actif("BUILD") });
+  setDetour(autre, "docs/projects/detour-d.md", DETOUR, "2026-10-18T10:00:00Z");
+  assert.deepEqual(
+    readState(autre).state,
+    actif("BUILD", { active_brief: "docs/projects/detour-d.md", since: "2026-10-18T10:00:00Z", detour: DETOUR }),
+  );
+  setDetour(autre, FICHE, null, "2026-10-18T11:00:00Z");
+  assert.deepEqual(readState(autre).state, actif("BUILD", { since: "2026-10-18T11:00:00Z" }));
+  assert.throws(() => setDetour(autre, "ailleurs/x.md", DETOUR), /active_brief : fiche \.md de docs\/projects\/ attendue/);
+  assert.equal(readState(autre).state.active_brief, FICHE, "rien n'est écrit");
+  setDetour(autre, FICHE, DETOUR);
+  assert.match(readState(autre).state.since, /^\d{4}-\d{2}-\d{2}T/, "horodatage par défaut");
+});
+
+test("QUA-050 : le contexte dit le détour en cours et comment le reprendre ; la règle de BUILD dit d'en ouvrir un", () => {
+  const racine = depot({ state: actif("BUILD", { detour: DETOUR }) });
+  const texte = context(readState(racine), racine);
+  assert.match(
+    texte,
+    /Détour en cours \(QUA-050\), ouvert depuis docs\/projects\/chantier\.md \(branche chantier\/x, travail en cours mis de côté par l'outil\) : .* sur la branche detour\/d ; PR intitulée « Détour de docs\/projects\/chantier\.md : … »/,
+  );
+  assert.match(
+    texte,
+    /une fois la PR fusionnée, `node \.githooks\/detour\.mjs resume`\. Jamais de stash ni de changement de branche à la main\./,
+  );
+  assert.match(
+    texte,
+    /Un défaut préalable hors du cadrage : un détour, `node \.githooks\/detour\.mjs open <nom> --title <défaut>`, jamais un élargissement sans rapport\./,
+  );
+  const en = depot({ lang: "en", state: actif("BUILD", { detour: DETOUR }) });
+  const anglais = context(readState(en), en);
+  assert.match(anglais, /Detour in progress \(QUA-050\), opened from docs\/projects\/chantier\.md \(branch chantier\/x/);
+  assert.match(anglais, /A prior defect outside the scope: a detour, `node \.githooks\/detour\.mjs open <name> --title <defect>`/);
+  assert.doesNotMatch(context(readState(depot({ state: actif("BUILD") })), racine), /Détour en cours/);
+});
+
+// --- Réouverture d'un chantier clos dont la PR révèle un défaut (QUA-116) ---
+
+const CONTENU_FICHE = `# Projet : Exemple
+
+**Statut** : cadré le 2026-10-23.
+
+<!-- scope
+files:
+  - src/a.ts
+-->
+
+## Critères d'acceptation
+
+- Un critère — \`QUA-001\`
+`;
+
+/**
+ * Dépôt git : branche principale, branche workstream/exemple où la fiche est commitée puis supprimée
+ * par le commit de clôture ; état CLOSING (fusion automatique et file décidées au lancement).
+ */
+function depotClos({ lang, intention = false } = {}) {
+  const racine = depot({ fiche: false, lang });
+  const git = (...args) => {
+    const r = spawnSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: racine, encoding: "utf8" });
+    assert.equal(r.status, 0, `git ${args.join(" ")} : ${r.stderr}`);
+    return r.stdout.trim();
+  };
+  writeFileSync(join(racine, ".gitignore"), ".drwil/state.json\n.drwil/reminder.json\n");
+  writeFileSync(join(racine, "docs", "projects", "suivante.md"), CONTENU_FICHE.replace("Exemple", "Suivante"));
+  git("init", "-q", "-b", "master");
+  git("config", "user.name", "t");
+  git("config", "user.email", "t@t");
+  if (intention) {
+    mkdirSync(join(racine, "docs", "intentions"), { recursive: true });
+    writeFileSync(join(racine, "docs", "intentions", "origine.md"), "# Origine\n");
+  }
+  git("add", "-A");
+  git("commit", "-qm", "init");
+  git("checkout", "-qb", "workstream/exemple");
+  const citations = intention ? "\n**Intention** : `docs/intentions/origine.md`, `docs/introuvable.md`\n" : "";
+  writeFileSync(join(racine, FICHE), CONTENU_FICHE + citations);
+  git("add", "-A");
+  git("commit", "-qm", "cadrage");
+  mkdirSync(join(racine, "src"));
+  writeFileSync(join(racine, "src", "a.ts"), "a\n");
+  git("add", "-A");
+  git("commit", "-qm", "travail");
+  writeFileSync(join(racine, FICHE), `${CONTENU_FICHE}${citations}\nDernière retouche avant la clôture.\n`);
+  git("commit", "-qam", "reprise");
+  rmSync(join(racine, FICHE));
+  if (intention) rmSync(join(racine, "docs", "intentions", "origine.md"));
+  writeFileSync(join(racine, "docs", "projects", "journal.md"), "# Journal\n\n## Exemple\n\n- Clos.\n");
+  git("add", "-A");
+  git("commit", "-qm", "clôture");
+  writeState(racine, actif("CLOSING", { auto_merge: true, queue: ["docs/projects/suivante.md"], queue_merge: true }));
+  return { racine, git };
+}
+
+/** gh simulé : `pr view` rend la PR (`pr` null : gh muet), `pr merge --disable-auto` l'annule ; appels consignés. */
+function ghSimule(racine, pr, { annule = true, resteProgrammee = false } = {}) {
+  const appels = [];
+  let courante = pr && { ...pr };
+  const gh = (_root, args) => {
+    appels.push({ args, head: spawnSync("git", ["rev-parse", "HEAD"], { cwd: racine, encoding: "utf8" }).stdout.trim() });
+    if (args[0] === "pr" && args[1] === "view") return courante ? JSON.stringify(courante) : null;
+    if (args[0] === "pr" && args[1] === "merge" && args.includes("--disable-auto")) {
+      if (!annule) return null;
+      if (!resteProgrammee) courante = { ...courante, autoMergeRequest: null };
+      return "";
+    }
+    return null;
+  };
+  return { gh, appels };
+}
+
+const PR_OUVERTE = { number: 42, state: "OPEN", autoMergeRequest: { mergeMethod: "MERGE" } };
+
+test("QUA-116 : depuis CLOSING, PR ouverte, la réouverture annule d'abord la fusion automatique, restaure la fiche dans son propre commit et repasse en BUILD", () => {
+  const { racine, git } = depotClos();
+  const avant = git("rev-parse", "HEAD");
+  const attendu = git("show", `${avant}~1:${FICHE}`);
+  const { gh, appels } = ghSimule(racine, PR_OUVERTE);
+  const r = reopen(racine, { gh, now: MAINTENANT });
+  assert.equal(r.code, 0, r.message);
+  assert.match(r.message, /CLOSING → BUILD \(réouverture de docs\/projects\/exemple\.md, PR #42 ouverte\)/);
+  assert.match(r.message, /fusion automatique annulée/);
+  assert.match(r.message, /restaurée telle qu'avant la clôture, dans son propre commit/);
+
+  // Fusion automatique annulée avant tout commit.
+  const annulation = appels.find((a) => a.args.includes("--disable-auto"));
+  assert.deepEqual(annulation.args, ["pr", "merge", "42", "--disable-auto"]);
+  assert.equal(annulation.head, avant, "l'annulation passe avant le premier commit");
+
+  // Fiche telle qu'au commit qui précède la clôture, dans un commit qui ne touche qu'elle ; historique gardé.
+  assert.equal(readFileSync(join(racine, FICHE), "utf8").trim(), attendu);
+  assert.equal(git("rev-parse", "HEAD~1"), avant, "un commit de plus, rien de réécrit");
+  assert.equal(git("diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"), FICHE);
+  assert.match(git("log", "-1", "--format=%s"), /^Réouverture de docs\/projects\/exemple\.md : défaut révélé par la PR #42$/);
+  assert.equal(git("branch", "--show-current"), "workstream/exemple", "même branche");
+  assert.equal(git("status", "--porcelain"), "");
+
+  // BUILD sur la fiche, fusion autorisée et file gardées.
+  assert.deepEqual(
+    readState(racine).state,
+    actif("BUILD", {
+      since: MAINTENANT,
+      auto_merge: true,
+      queue: ["docs/projects/suivante.md"],
+      queue_merge: true,
+      reopened: { pr: 42 },
+      history: [{ activity: "BUILD", at: MAINTENANT, reopened: true }],
+    }),
+  );
+  const texte = context(readState(racine), racine);
+  assert.match(texte, /Chantier rouvert après sa clôture \(QUA-116\), PR #42 ouverte : corriger le défaut sur cette branche/);
+  assert.match(texte, /attend le oui de l'humain \(`node \.githooks\/detour\.mjs allow`/);
+});
+
+test("QUA-116 : la réouverture restaure, dans le même commit que la fiche, les fichiers cités que la branche a supprimés, jamais un fichier absent de la branche", () => {
+  const { racine, git } = depotClos({ intention: true });
+  assert.ok(!existsSync(join(racine, "docs", "intentions", "origine.md")));
+  const r = reopen(racine, { gh: ghSimule(racine, PR_OUVERTE).gh, now: MAINTENANT });
+  assert.equal(r.code, 0, r.message);
+  assert.match(
+    r.message,
+    /1 fichier\(s\) cité\(s\) par la fiche, supprimé\(s\) par la branche, restauré\(s\) dans ce même commit \(\w+\) : docs\/intentions\/origine\.md/,
+  );
+  assert.equal(readFileSync(join(racine, "docs", "intentions", "origine.md"), "utf8"), "# Origine\n");
+  assert.ok(!existsSync(join(racine, "docs", "introuvable.md")), "un chemin jamais présent n'est pas inventé");
+  assert.deepEqual(git("diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD").split("\n").sort(), [
+    "docs/intentions/origine.md",
+    FICHE,
+  ]);
+  assert.equal(git("status", "--porcelain"), "");
+});
+
+test("QUA-116 : sans fusion automatique programmée, rien n'est annulé ; fiche encore dans HEAD, rien n'est restauré", () => {
+  const { racine } = depotClos();
+  const { gh, appels } = ghSimule(racine, { ...PR_OUVERTE, autoMergeRequest: null });
+  assert.equal(reopen(racine, { gh, now: MAINTENANT }).code, 0);
+  assert.ok(!appels.some((a) => a.args.includes("--disable-auto")));
+
+  // Clôture pas encore commitée (fiche dans HEAD) : état seul, aucun commit.
+  const autre = depotClos();
+  autre.git("reset", "-q", "--hard", "HEAD~1");
+  const tete = autre.git("rev-parse", "HEAD");
+  const r = reopen(autre.racine, { gh: ghSimule(autre.racine, PR_OUVERTE).gh });
+  assert.equal(r.code, 0, r.message);
+  assert.doesNotMatch(r.message, /restaurée/);
+  assert.equal(autre.git("rev-parse", "HEAD"), tete);
+  assert.equal(readState(autre.racine).state.activity, "BUILD");
+});
+
+test("QUA-116 : réouverture refusée sans rien changer — hors CLOSING, arbre modifié, branche principale, PR fusionnée, fermée ou inconnue, rien à restaurer", () => {
+  const cas = [
+    [
+      "hors CLOSING",
+      ({ racine }) => writeState(racine, actif("VERIFY", { active_brief: "docs/projects/suivante.md" })),
+      PR_OUVERTE,
+      /activité VERIFY — on rouvre depuis CLOSING/,
+    ],
+    ["arbre modifié", ({ racine }) => writeFileSync(join(racine, "src", "a.ts"), "b\n"), PR_OUVERTE, /arbre modifié/],
+    ["branche principale", ({ git }) => git("checkout", "-q", "master"), PR_OUVERTE, /branche du chantier/],
+    ["gh muet", () => {}, null, /état de la PR de workstream\/exemple est inconnu \(gh absent/],
+    ["PR fusionnée", () => {}, { ...PR_OUVERTE, state: "MERGED" }, /PR #42 est MERGED, pas ouverte — un défaut après la fusion/],
+    ["PR fermée", () => {}, { ...PR_OUVERTE, state: "CLOSED" }, /PR #42 est CLOSED/],
+    ["réponse illisible", () => {}, { state: "OPEN" }, /inconnu/],
+    [
+      "aucun commit de clôture",
+      ({ racine }) => writeState(racine, actif("CLOSING", { active_brief: "docs/projects/jamais.md" })),
+      PR_OUVERTE,
+      /aucun commit de workstream\/exemple ne supprime docs\/projects\/jamais\.md/,
+    ],
+  ];
+  for (const [nom, preparer, pr, motif] of cas) {
+    const d = depotClos();
+    preparer(d);
+    const tete = d.git("rev-parse", "HEAD");
+    const etat = readState(d.racine).state;
+    const { gh, appels } = ghSimule(d.racine, pr);
+    const r = reopen(d.racine, { gh });
+    assert.equal(r.code, 1, nom);
+    assert.match(r.message, motif, nom);
+    assert.match(r.message, /rien n'a changé/, nom);
+    assert.ok(!appels.some((a) => a.args.includes("--disable-auto")), `${nom} : fusion automatique laissée`);
+    assert.equal(d.git("rev-parse", "HEAD"), tete, `${nom} : aucun commit`);
+    assert.deepEqual(readState(d.racine).state, etat, `${nom} : état inchangé`);
+  }
+});
+
+test("QUA-116 : annulation de la fusion automatique en échec, ou fusion encore programmée : refus avant tout commit ; commit refusé par un hook : fiche retirée", () => {
+  for (const options of [{ annule: false }, { resteProgrammee: true }]) {
+    const { racine, git } = depotClos();
+    const tete = git("rev-parse", "HEAD");
+    const r = reopen(racine, { gh: ghSimule(racine, PR_OUVERTE, options).gh });
+    assert.equal(r.code, 1);
+    assert.match(r.message, /fusion automatique de la PR #42 n'a pas pu être annulée \(`gh pr merge 42 --disable-auto`\)/);
+    assert.equal(git("rev-parse", "HEAD"), tete);
+    assert.ok(!existsSync(join(racine, FICHE)));
+    assert.equal(readState(racine).state.activity, "CLOSING");
+  }
+  // Un hook pre-commit qui refuse : rien ne reste, ni fiche ni index, état inchangé.
+  const { racine, git } = depotClos();
+  const tete = git("rev-parse", "HEAD");
+  writeFileSync(join(racine, ".git", "hooks", "pre-commit"), "#!/bin/sh\necho 'refusé par le hook' >&2\nexit 1\n", { mode: 0o755 });
+  const r = reopen(racine, { gh: ghSimule(racine, PR_OUVERTE).gh });
+  assert.equal(r.code, 1);
+  assert.match(r.message, /le commit de la fiche restaurée a échoué \(refusé par le hook\) — fiche retirée, état inchangé/);
+  assert.match(r.message, /fusion automatique annulée et NON reprogrammée/);
+  assert.equal(git("rev-parse", "HEAD"), tete);
+  assert.equal(git("status", "--porcelain"), "");
+  assert.equal(readState(racine).state.activity, "CLOSING");
+});
+
+test("QUA-116 : l'état rouvert se valide de BUILD à CLOSING, suit les transitions et tombe au retour en SCOPING ; commande et anglais", async () => {
+  const racine = depot({ state: actif("BUILD", { reopened: { pr: 7 } }) });
+  assert.deepEqual(readState(racine).problems, []);
+  assert.match(validateState(actif("BUILD", { reopened: true }), racine)[0], /reopened : objet \{ pr, human\? \} attendu/);
+  assert.match(validateState(actif("BUILD", { reopened: { pr: 7, human: "oui" } }), racine)[0], /reopened : objet/);
+  assert.match(validateState({ ...NEUTRAL_STATE, reopened: { pr: 7 } }, racine)[0], /reopened : seulement de BUILD à CLOSING/);
+  assert.match(validateState(actif("REQUEST", { reopened: { pr: 7 } }), racine)[0], /seulement de BUILD à CLOSING/);
+  assert.throws(() => writeState(racine, actif("BUILD", { reopened: 1 })), /reopened/);
+  assert.deepEqual(readState(racine).state.reopened, { pr: 7 }, "rien d'écrit");
+
+  for (const vers of ["EVIDENCE", "BUILD", "EVIDENCE", "VERIFY"]) assert.equal((await move(racine, { to: vers })).code, 0, vers);
+  assert.deepEqual(readState(racine).state.reopened, { pr: 7 }, "gardé jusqu'à la clôture");
+  writeState(racine, actif("CLOSING", { reopened: { pr: 7 }, auto_merge: true }));
+  assert.equal((await move(racine, { to: "SCOPING" })).code, 0);
+  assert.equal(readState(racine).state.reopened, undefined, "le retour en SCOPING l'efface");
+
+  // La règle de CLOSING dit la réouverture, en dernier : jamais un contournement.
+  const clos = depot({ state: actif("CLOSING") });
+  assert.match(
+    context(readState(clos), clos),
+    /Un défaut révélé par la PR, ouverte et pas encore fusionnée .*`node \.githooks\/state\.mjs reopen`/,
+  );
+
+  // Commande : hors CLOSING, refus lisible ; en anglais aussi.
+  let r = await capturer(() => main(["reopen"], racine));
+  assert.equal(r.code, 1);
+  assert.match(r.erreurs, /^✗ réouverture refusée : activité SCOPING/);
+  const en = depotClos({ lang: "en" });
+  r = await capturer(() => main(["reopen"], en.racine));
+  assert.equal(r.code, 1, "sans PR sur une forge, l'état de la PR est inconnu");
+  assert.match(r.erreurs, /reopening refused: the state of the PR of workstream\/exemple is unknown/);
+  const ok = reopen(en.racine, { gh: ghSimule(en.racine, PR_OUVERTE).gh });
+  assert.match(ok.message, /CLOSING → BUILD \(reopening of docs\/projects\/exemple\.md, PR #42 open\)/);
+  assert.match(en.git("log", "-1", "--format=%s"), /^Reopening of docs\/projects\/exemple\.md: defect revealed by PR #42$/);
+  r = await capturer(() => main(["reopen"], en.racine));
+  assert.match(r.erreurs, /reopening refused: activity BUILD/);
+  assert.match(context(readState(en.racine), en.racine), /Workstream reopened after its closing \(QUA-116\), PR #42 open/);
+});
+
+test("QUA-181 : réouverture échouée après l'annulation de la fusion : le refus dit que l'humain reprogramme, l'état le garde jusqu'à une réouverture réussie ou au retour en SCOPING ; en anglais aussi", async () => {
+  for (const lang of ["fr", "en"]) {
+    const { racine } = depotClos({ lang });
+    writeFileSync(join(racine, ".git", "hooks", "pre-commit"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    const r = reopen(racine, { gh: ghSimule(racine, PR_OUVERTE).gh });
+    assert.equal(r.code, 1);
+    assert.match(
+      r.message,
+      lang === "fr"
+        ? /NON reprogrammée.*jamais seul.*à l'humain de la reprogrammer/s
+        : /NOT scheduled again.*never reschedules.*up to the human/s,
+    );
+    assert.deepEqual(readState(racine).state.merge_cancelled, { pr: 42 });
+    assert.equal(readState(racine).state.activity, "CLOSING");
+    const rappel = lang === "fr" ? /PR #42 ANNULÉE .*NON reprogrammée/ : /PR #42 CANCELLED .*NOT scheduled again/;
+    assert.match(shortReminder(readState(racine), racine), rappel);
+    assert.match(context(readState(racine), racine), rappel);
+
+    // Sans le hook, la réouverture réussit : la marque tombe.
+    rmSync(join(racine, ".git", "hooks", "pre-commit"));
+    assert.equal(reopen(racine, { gh: ghSimule(racine, PR_OUVERTE).gh }).code, 0);
+    assert.equal(readState(racine).state.merge_cancelled, undefined);
+    assert.doesNotMatch(shortReminder(readState(racine), racine), rappel);
+  }
+  // Sans fusion programmée, rien n'a été annulé : pas de marque.
+  const { racine } = depotClos();
+  writeFileSync(join(racine, ".git", "hooks", "pre-commit"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+  reopen(racine, { gh: ghSimule(racine, { ...PR_OUVERTE, autoMergeRequest: null }).gh });
+  assert.equal(readState(racine).state.merge_cancelled, undefined);
+
+  // Validation : seulement en CLOSING, objet { pr } ; le retour en SCOPING l'efface.
+  assert.match(validateState(actif("CLOSING", { merge_cancelled: true }), racine)[0], /merge_cancelled : objet \{ pr \} attendu/);
+  assert.ok(
+    validateState(actif("BUILD", { merge_cancelled: { pr: 42 } }), racine).some((p) => /merge_cancelled : seulement en CLOSING/.test(p)),
+  );
+  const clos = depot({ state: actif("CLOSING", { merge_cancelled: { pr: 42 } }) });
+  assert.deepEqual(readState(clos).problems, []);
+  assert.equal((await move(clos, { to: "SCOPING" })).code, 0);
+  assert.equal(readState(clos).state.merge_cancelled, undefined);
+});
+
+const CRITERES = (extra = "") =>
+  `# Projet : Exemple\n\n**Statut** : cadré le 2026-10-09.\n**Maturité** : prêt\n\n<!-- scope\nfiles:\n  - src/auth/login.ts\n-->\n\n## Critères d'acceptation\n\n- Un critère sur\n  deux lignes — contrat à créer\n- Autre critère [humain] — \`QUA-001\` (contrat modifié)${extra}\n\n## 6. Increments\n\n- **Lot 1** [IA] : tout.\n`;
+
+/** Dépôt cadré dont la fiche porte des critères, lançable par un humain (sans terminal : `start(…, { human: true })`). */
+function depotCriteres({ lang, texte = CRITERES() } = {}) {
+  const { racine, git } = depotCadre(lang ? { lang } : undefined);
+  writeFileSync(join(racine, FICHE), texte);
+  git("add", "-A");
+  git("commit", "-qm", "critères");
+  return { racine, git };
+}
+const accepte = (racine) => JSON.parse(readFileSync(join(racine, ".drwil", "evidence", "acceptance.json"), "utf8"));
+
+test("QUA-174 : l'empreinte des critères ignore la preuve citée et la mise en forme, pas le texte", () => {
+  const base = criteriaFingerprint(CRITERES());
+  assert.match(base, /^sha256:[0-9a-f]{16}$/);
+  const lie = CRITERES()
+    .replace("deux lignes — contrat à créer", "deux lignes — `QUA-172`")
+    .replace("`QUA-001` (contrat modifié)", "`QUA-002`");
+  assert.equal(criteriaFingerprint(lie), base, "un lien de preuve écrit ensuite ne change pas l'empreinte");
+  assert.equal(criteriaFingerprint(CRITERES().replace("Un critère sur\n  deux lignes", "Un  critère sur deux lignes")), base);
+  assert.equal(criteriaFingerprint(CRITERES().replace("deux lignes", "trois lignes")) === base, false);
+  assert.equal(criteriaFingerprint(CRITERES().replace("— contrat à créer", "— contract to create")), base);
+  assert.equal(criteriaFingerprint("# Fiche\n\n## 2. Hors périmètre\n\n- rien\n"), null);
+  assert.equal(criteriaFingerprint("## Acceptance criteria\n- One\n"), criteriaFingerprint("## Critères d'acceptation\n- One\n"));
+});
+
+test("QUA-174 : seules les marques de classification humaines sont exclues, pas les changements de sens", () => {
+  const texte = (critere) => `## Critères d'acceptation\n- ${critere} — \`QUA-001\`\n`;
+  const base = criteriaFingerprint(texte("Un résultat visible"));
+  for (const marque of ["[humain]", "[human]", "[HUMAIN]", "[HUMAN]"]) {
+    for (const critere of [`${marque} Un résultat visible`, `Un ${marque}\n  résultat visible`, `Un résultat visible ${marque}`]) {
+      assert.equal(criteriaFingerprint(texte(critere)), base, critere);
+    }
+    assert.notEqual(criteriaFingerprint(texte(`Un résultat invisible ${marque}`)), base);
+  }
+  for (const critere of ["Un résultat visible [IA]", "Un résultat visible [humains]", "Un résultat visible humain"]) {
+    assert.notEqual(criteriaFingerprint(texte(critere)), base, critere);
+  }
+  for (const delimiteur of ["`", "``"]) {
+    const literal = `Un résultat ${delimiteur}[humain]${delimiteur} visible`;
+    assert.notEqual(criteriaFingerprint(texte(literal)), base, "une marque citée comme texte reste du sens");
+    assert.notEqual(criteriaFingerprint(texte(literal)), criteriaFingerprint(texte(literal.replace("[humain]", "[human]"))));
+    assert.equal(criteriaFingerprint(texte(`${literal} [humain]`)), criteriaFingerprint(texte(literal)));
+  }
+});
+
+test("QUA-174 : la place de la marque humaine ne change pas l'empreinte, entre le tiret et la preuve comprise", () => {
+  const sans = criteriaFingerprint("## Critères d'acceptation\n- Un résultat visible — `QUA-013`\n");
+  for (const marque of ["[humain]", "[human]", "[Humain]"]) {
+    for (const critere of [
+      `${marque} Un résultat visible — \`QUA-013\``,
+      `Un résultat visible — ${marque} \`QUA-013\``,
+      `Un résultat visible — \`QUA-013\` ${marque}`,
+      `Un résultat visible — ${marque} contrat à créer`,
+    ]) {
+      assert.equal(criteriaFingerprint(`## Critères d'acceptation\n- ${critere}\n`), sans, critere);
+    }
+  }
+  const lu = "## Critères d'acceptation\n- Un résultat visible — [humain] `QUA-013`\n";
+  assert.notEqual(criteriaFingerprint(lu.replace("visible", "invisible")), sans, "le texte compte toujours");
+  assert.notEqual(
+    criteriaFingerprint("## Critères d'acceptation\n- Un résultat visible — `[humain]` `QUA-013`\n"),
+    sans,
+    "une marque citée en code reste du texte, même entre le tiret et la preuve",
+  );
+});
+
+test("QUA-174 : une empreinte de l'ancien calcul reste reconnue en repli ; un critère modifié est refusé avec les deux calculs", () => {
+  const { racine } = depotCriteres();
+  const ancienne = (texte) =>
+    `sha256:${createHash("sha256")
+      .update(
+        JSON.stringify(
+          [...texte.matchAll(/^- (.+)$/gm)].map((m) =>
+            m[1]
+              .replace(/\s+[—–]\s+(?:contrat à créer|contract to create|`[A-Za-z][\w.:-]*`).*$/, "")
+              .replace(/(`+).*?\1|\[(?:humain|human)\]/gi, (x) => (x.startsWith("`") ? x : ""))
+              .replace(/\s+/g, " ")
+              .trim(),
+          ),
+        ),
+      )
+      .digest("hex")
+      .slice(0, 16)}`;
+  const fiche = "# Fiche\n\n## Critères d'acceptation\n\n- Un résultat visible — [humain] `QUA-013`\n- Autre — `QUA-001`\n";
+  assert.notEqual(ancienne(fiche), criteriaFingerprint(fiche), "l'ancien calcul gardait la preuve derrière la marque");
+  mkdirSync(join(racine, ".drwil", "evidence"), { recursive: true });
+  const enregistre = { [FICHE]: { fingerprint: ancienne(fiche), acceptedAt: "2026-11-14T10:00:00.000Z" } };
+  writeFileSync(join(racine, ".drwil", "evidence", "acceptance.json"), JSON.stringify(enregistre));
+  assert.equal(acceptanceCheck(racine, FICHE, fiche).kind, "same", "un chantier accepté avant la mise à jour se clôt");
+  assert.equal(acceptanceCheck(racine, FICHE, fiche.replace("Autre", "Autre chose")).kind, "changed");
+  assert.equal(acceptanceCheck(racine, FICHE, fiche.replace("visible", "invisible")).kind, "changed");
+  assert.deepEqual(
+    JSON.parse(readFileSync(join(racine, ".drwil", "evidence", "acceptance.json"), "utf8")),
+    enregistre,
+    "le repli n'écrit rien",
+  );
+});
+
+test("QUA-174 : le lancement humain enregistre l'empreinte des critères acceptés, de la fiche et de celles qu'il met en file", () => {
+  const { racine, git } = depotCriteres();
+  writeFileSync(join(racine, "docs", "projects", "suivante.md"), CRITERES().replace("src/auth/login.ts", "src/s.ts"));
+  git("add", "-A");
+  git("commit", "-qm", "suivante");
+  const r = start(racine, FICHE, { human: true, queue: ["docs\\projects\\suivante.md"], now: "2026-10-20T10:00:00.000Z" });
+  assert.equal(r.code, 0, r.message);
+  const tout = accepte(racine);
+  assert.deepEqual(Object.keys(tout).sort(), [FICHE, "docs/projects/suivante.md"].sort());
+  assert.equal(tout[FICHE].fingerprint, criteriaFingerprint(readFileSync(join(racine, FICHE), "utf8")));
+  assert.match(tout[FICHE].acceptedAt, /^\d{4}-\d{2}-\d{2}T/);
+  const lu = readFileSync(join(racine, FICHE), "utf8");
+  assert.equal(acceptanceCheck(racine, FICHE, lu).kind, "same");
+  assert.equal(acceptanceCheck(racine, FICHE, lu.replace("Un critère sur", "[humain] Un critère sur")).kind, "same");
+  assert.equal(acceptanceCheck(racine, FICHE, lu.replace(" [humain]", "")).kind, "same");
+  assert.deepEqual(accepte(racine), tout, "la classification ne renouvelle pas l'acceptation humaine enregistrée");
+  assert.equal(acceptanceCheck(racine, FICHE, lu.replace("Un critère", "Un autre critère")).kind, "changed");
+});
+
+test("QUA-174 : un lancement refusé n'enregistre rien ; sans critère ou sans fiche lisible, rien non plus", () => {
+  const { racine } = depotCriteres();
+  assert.equal(start(racine, "docs/projects/inconnue.md", { human: true }).code, 1);
+  assert.equal(existsSync(join(racine, ".drwil", "evidence", "acceptance.json")), false);
+  const sans = depotCadre().racine;
+  assert.equal(start(sans, FICHE, { human: true }).code, 0);
+  assert.equal(existsSync(join(sans, ".drwil", "evidence", "acceptance.json")), false, "la fiche d'exemple n'a aucun critère");
+  assert.equal(acceptanceCheck(sans, FICHE, "").kind, "none");
+  assert.equal(recordAcceptance(sans, "docs/projects/absente.md"), null);
+});
+
+test("QUA-175 : la fiche prise en file par l'agent garde l'acceptation que l'humain a donnée, une autre est oubliée", () => {
+  const { racine, git } = depotCriteres();
+  writeFileSync(join(racine, "docs", "projects", "suivante.md"), CRITERES().replace("src/auth/login.ts", "src/s.ts"));
+  git("add", "-A");
+  git("commit", "-qm", "suivante");
+  assert.equal(start(racine, FICHE, { human: true, queue: ["docs/projects/suivante.md"] }).code, 0);
+  const donnee = accepte(racine)["docs/projects/suivante.md"];
+  writeState(racine, { ...NEUTRAL_STATE, queue: ["docs/projects/suivante.md"] });
+  prouver(racine);
+  assert.equal(start(racine, "docs/projects/suivante.md").code, 0);
+  assert.deepEqual(accepte(racine)["docs/projects/suivante.md"], donnee);
+  assert.equal(accepte(racine)[FICHE] !== undefined, true);
+});
+
+test("QUA-175 : mode agent, sans humain : le lancement n'enregistre aucune acceptation, et efface une ancienne", async () => {
+  const { racine } = depotCriteres();
+  writeFileSync(join(racine, ".drwil", "ia-first.json"), JSON.stringify({ transitions: "agent" }));
+  mkdirSync(join(racine, ".drwil", "evidence"), { recursive: true });
+  writeFileSync(
+    join(racine, ".drwil", "evidence", "acceptance.json"),
+    JSON.stringify({ [FICHE]: { fingerprint: "sha256:ancienne" }, autre: { fingerprint: "x" } }),
+  );
+  assert.equal(start(racine, FICHE).code, 0);
+  assert.deepEqual(Object.keys(accepte(racine)), ["autre"]);
+  // Fichier absent ou illisible : aucune acceptation, jamais une erreur.
+  writeFileSync(join(racine, ".drwil", "evidence", "acceptance.json"), "pas du json");
+  assert.equal(acceptanceCheck(racine, FICHE, "").kind, "none");
+  writeFileSync(join(racine, ".drwil", "evidence", "acceptance.json"), "[]");
+  assert.equal(acceptanceCheck(racine, FICHE, "").kind, "none");
+  const retour = await move(racine, { to: "SCOPING" });
+  assert.equal(retour.code, 0, retour.message);
+});
+
+test("QUA-175 : le retour en SCOPING oublie l'acceptation de la fiche quittée", async () => {
+  const { racine } = depotCriteres();
+  assert.equal(start(racine, FICHE, { human: true }).code, 0);
+  assert.deepEqual(Object.keys(accepte(racine)), [FICHE]);
+  const r = await move(racine, { to: "SCOPING" });
+  assert.equal(r.code, 0, r.message);
+  assert.deepEqual(accepte(racine), {});
+});
+
+test("QUA-175 : accept refusé sans terminal interactif, ligne de commande comprise — en anglais aussi", async () => {
+  const { racine } = depotCriteres();
+  start(racine, FICHE, { human: true });
+  let r = await capturer(() => main(["accept"], racine));
+  assert.equal(r.code, 1);
+  assert.match(r.erreurs, /^✗ acceptation refusée : seul un terminal interactif/);
+  assert.equal(await accept(racine), 1);
+  const en = depotCriteres({ lang: "en" }).racine;
+  r = await capturer(() => main(["accept"], en));
+  assert.match(r.erreurs, /^✗ acceptance refused: only an interactive terminal/);
+});
+
+test("QUA-175 : le sondage drwil-accept se prépare sans rien écrire ; il ne s'enregistre que pour la fiche active aux critères du sondage", async () => {
+  const { racine } = depotCriteres();
+  assert.match(acceptancePoll(racine).message, /aucun chantier actif/);
+  let r = await capturer(() => main(["poll", "accept"], racine));
+  assert.equal(r.code, 1);
+  assert.match(r.erreurs, /^✗ acceptation impossible : aucun chantier actif/);
+  r = await capturer(() => main(["poll"], racine));
+  assert.equal(r.code, 2);
+  assert.match(r.erreurs, /^✗ utilisation : node \.githooks\/state\.mjs poll <accept\|move\|detour>/);
+
+  assert.equal(start(racine, FICHE, { human: true }).code, 0);
+  writeFileSync(join(racine, FICHE), CRITERES().replace("Un critère", "Un critère modifié"));
+  const avant = readFileSync(join(racine, ".drwil", "evidence", "acceptance.json"), "utf8");
+  r = await capturer(() => main(["poll", "accept"], racine));
+  assert.equal(r.code, 0, r.erreurs);
+  const sondage = JSON.parse(r.sortie);
+  const q = sondage.questions[0];
+  assert.equal(q.header, "drwil-accept");
+  assert.ok(!("multiSelect" in q), "multiSelect:false n'est jamais écrit : Claude Code le retire avant le hook");
+  assert.match(
+    q.question,
+    /^drwil-accept docs\/projects\/exemple\.md\nCritères de docs\/projects\/exemple\.md :\n- Un critère modifié sur deux lignes/,
+  );
+  assert.deepEqual(
+    q.options.map((o) => o.label),
+    ["Accepter", "Ne pas accepter"],
+  );
+  assert.ok(
+    q.options.every((o) => !/recommand/i.test(o.label + o.description)),
+    "aucune option recommandée",
+  );
+  assert.equal(readFileSync(join(racine, ".drwil", "evidence", "acceptance.json"), "utf8"), avant, "la préparation n'écrit rien");
+  const prepare = acceptancePoll(racine);
+  assert.deepEqual(prepare.poll, sondage);
+  prepare.poll.questions[0].options[0].label = "muté";
+  assert.equal(acceptancePoll(racine).poll.questions[0].options[0].label, "Accepter", "les textes partagés ne sont jamais mutés");
+
+  // Seules la fiche active et l'empreinte de ses critères au moment du sondage enregistrent.
+  const { data } = acceptancePoll(racine);
+  for (const faux of [undefined, { ...data, brief: "docs/projects/autre.md" }, { ...data, fingerprint: "sha256:0000000000000000" }])
+    assert.equal(acceptFromPoll(racine, faux), null);
+  assert.equal(readFileSync(join(racine, ".drwil", "evidence", "acceptance.json"), "utf8"), avant);
+  assert.equal(acceptanceCheck(racine, FICHE, readFileSync(join(racine, FICHE), "utf8")).kind, "changed");
+  // Un lien de preuve écrit entre la question et la réponse ne change pas les critères acceptés.
+  writeFileSync(join(racine, FICHE), readFileSync(join(racine, FICHE), "utf8").replace("contrat à créer", "`QUA-172`"));
+  assert.match(acceptFromPoll(racine, data), /^critères de docs\/projects\/exemple\.md acceptés \(empreinte sha256:/);
+  assert.equal(acceptanceCheck(racine, FICHE, readFileSync(join(racine, FICHE), "utf8")).kind, "same");
+
+  writeFileSync(join(racine, FICHE), "# Projet : Exemple\n");
+  assert.match(acceptancePoll(racine).message, /n'a aucun critère d'acceptation/);
+  assert.equal(acceptFromPoll(racine, data), null, "critères retirés pendant la question");
+
+  const en = depotCriteres({ lang: "en" }).racine;
+  start(en, FICHE, { human: true });
+  assert.deepEqual(
+    acceptancePoll(en).poll.questions[0].options.map((o) => o.label),
+    ["Accept", "Do not accept"],
+  );
+  assert.match(acceptancePoll(en).poll.questions[0].question, /\n\nAccept these criteria as they are\?$/);
+  r = await capturer(() => main(["poll", "autre"], en));
+  assert.match(r.erreurs, /^✗ usage : node \.githooks\/state\.mjs poll <accept\|move\|detour>/);
+});
+
+test("QUA-175 : parmi les hooks et commandes du kit, seul state-acceptance.mjs écrit le fichier d'acceptation", () => {
+  // Ce que l'humain vérifiait à chaque attestation, recensé ici : tout le code livré (gabarit, CLI, vue) est lu.
+  const PAQUET = join(RACINE_DEPOT, "packages/drwil");
+  const fichiers = [];
+  const parcourir = (dossier) => {
+    for (const e of readdirSync(dossier, { withFileTypes: true })) {
+      const chemin = join(dossier, e.name);
+      if (e.isDirectory()) parcourir(chemin);
+      else if (/\.(mjs|cjs|js|ts|json|sh|ps1|html)$/.test(e.name) && !/\.test\.mjs$/.test(e.name)) fichiers.push(chemin);
+    }
+  };
+  for (const d of ["templates", "src", "bin", "serve"]) parcourir(join(PAQUET, d));
+  const rel = (f) => f.slice(PAQUET.length + 1).replace(/\\/g, "/");
+  const qui = (motif) =>
+    fichiers
+      .filter((f) => motif.test(readFileSync(f, "utf8")))
+      .map(rel)
+      .sort();
+  const MODULE = "templates/common/base/.githooks/state-acceptance.mjs";
+  assert.ok(fichiers.length > 100, "le code livré est bien lu");
+  assert.deepEqual(qui(/acceptance\.json/), [MODULE], "seul le module nomme le fichier d'acceptation");
+  assert.deepEqual(
+    qui(/\b(recordAcceptance|forgetAcceptance)\b/),
+    [MODULE, "templates/common/base/.githooks/state.mjs"],
+    "ses écrivains ne sont appelés que par state.mjs (start, move)",
+  );
+  // L'acceptation depuis le chat : seul le hook du sondage drwil-accept, sur la réponse de l'humain, l'appelle.
+  assert.deepEqual(qui(/\bacceptFromPoll\b/), [MODULE, "templates/common/tools/claude/.claude/hooks/accept-poll.mjs"]);
+  const module = readFileSync(join(PAQUET, MODULE), "utf8");
+  assert.equal(module.match(/writeFileSync\(/g).length, 1, "une seule écriture, dans writeAll");
+  assert.match(module, /function writeAll\(root, all\) \{\n\s+mkdirSync[^\n]+\n\s+writeFileSync\(/);
+  assert.equal(module.match(/\bwriteAll\(/g).length, 3, "writeAll : sa définition, recordAcceptance et forgetAcceptance");
+  // L'acceptation n'est enregistrée que par un lancement que l'appelant déclare humain : sondage lu par le hook,
+  // worktree, file construite par sondages (state-draft.mjs). Un nouvel appelant fait échouer ce test : il se juge avant d'entrer ici.
+  assert.deepEqual(qui(/\bstart\([^)]*human:\s*true/), [
+    "templates/common/base/.githooks/state-draft.mjs",
+    "templates/common/base/.githooks/worktree.mjs",
+    "templates/common/tools/claude/.claude/hooks/prompt-hook.mjs",
+  ]);
+});
+
+test("QUA-117 : le sondage drwil-move se prépare sans rien écrire ; seule la réponse lue par le hook applique la transition humaine, sur l'état du sondage", async () => {
+  const racine = depot();
+  const refus = await move(racine, { to: "EXPECTATION", brief: FICHE }, { tty: false, now: MAINTENANT });
+  assert.equal(refus.code, 1);
+  assert.match(
+    refus.message,
+    /décision humaine : terminal interactif ou sondage du chat .* ; depuis le chat : `node \.githooks\/state\.mjs poll move EXPECTATION --brief docs\/projects\/exemple\.md` prépare le sondage `drwil-move`, à poser tel quel : seule la réponse de l'humain l'applique$/,
+  );
+  let r = await capturer(() => main(["poll", "move", "EXPECTATION", "--brief", FICHE], racine));
+  assert.equal(r.code, 0, r.erreurs);
+  const q = JSON.parse(r.sortie).questions[0];
+  assert.equal(q.header, "drwil-move");
+  assert.ok(!("multiSelect" in q), "multiSelect:false n'est jamais écrit : Claude Code le retire avant le hook");
+  assert.equal(
+    q.question,
+    `drwil-move EXPECTATION {"brief":"${FICHE}"}\nTransition : SCOPING → EXPECTATION\nFiche : ${FICHE}\n\nAutoriser cette transition ?`,
+  );
+  assert.deepEqual(
+    q.options.map((o) => o.label),
+    ["Autoriser", "Ne pas autoriser"],
+  );
+  assert.ok(
+    q.options.every((o) => !/recommand/i.test(o.label + o.description)),
+    "aucune option recommandée",
+  );
+  assert.equal(readState(racine).source, "missing", "la préparation n'écrit rien");
+  r = await capturer(() => main(["poll", "move"], racine));
+  assert.equal(r.code, 2);
+  assert.match(r.erreurs, /^✗ utilisation : node \.githooks\/state\.mjs poll move <ACTIVITE> \[--brief <fiche>\]/);
+  assert.match(movePoll(racine, { to: "VERIFY" }).message, /transition SCOPING → VERIFY interdite/);
+  assert.match(movePoll(racine, { to: "EXPECTATION" }).message, /ouvrir une attente exige --brief/);
+
+  // Seul l'état du sondage, inchangé, applique la transition : un autre état, ou le même sondage rejoué, rien.
+  const { data } = movePoll(racine, { to: "EXPECTATION", brief: FICHE });
+  for (const faux of [undefined, {}, { ...data, state: { ...data.state, activity: "REQUEST" } }])
+    assert.equal(await moveFromPoll(racine, faux), null);
+  assert.equal(readState(racine).source, "missing");
+  const fait = await moveFromPoll(racine, data);
+  assert.equal(fait.code, 0, fait.message);
+  assert.equal(fait.message, "SCOPING → EXPECTATION");
+  assert.equal(readState(racine).state.activity, "EXPECTATION");
+  assert.equal(await moveFromPoll(racine, data), null, "l'état a changé : le même sondage ne rejoue pas");
+  assert.match(
+    movePoll(racine, { to: "REQUEST" }).message,
+    /EXPECTATION → REQUEST n'est pas une décision humaine : `node \.githooks\/state\.mjs move REQUEST` suffit/,
+  );
+  assert.equal((await move(racine, { to: "REQUEST", request: "Lot 2" }, { now: MAINTENANT })).code, 0);
+  const lot = movePoll(racine, { to: "BUILD", request: "Lot 3" });
+  assert.match(lot.poll.questions[0].question, /^drwil-move BUILD \{"request":"Lot 3"\}\nTransition : REQUEST → BUILD\nDemande : Lot 3\n/);
+  assert.match((await move(racine, { to: "BUILD", request: "Lot 3" }, { now: MAINTENANT })).message, /poll move BUILD --request "Lot 3"`/);
+  assert.equal((await moveFromPoll(racine, lot.data)).code, 0);
+  assert.equal(readState(racine).state.activity, "BUILD");
+  assert.equal(readState(racine).state.active_request, "Lot 3");
+
+  // Le moteur refuse encore après la réponse : son message est rendu tel quel.
+  const invalide = depot();
+  const sondage = movePoll(invalide, { to: "EXPECTATION", brief: FICHE });
+  rmSync(join(invalide, FICHE));
+  assert.match((await moveFromPoll(invalide, sondage.data)).message, /introuvable/);
+
+  const agent = depot({ config: { transitions: "agent" } });
+  assert.match(movePoll(agent, { to: "EXPECTATION", brief: FICHE }).message, /n'est pas une décision humaine/);
+  const en = depot({ lang: "en" });
+  const anglais = movePoll(en, { to: "EXPECTATION", brief: FICHE }).poll.questions[0];
+  assert.deepEqual(
+    anglais.options.map((o) => o.label),
+    ["Allow", "Do not allow"],
+  );
+  assert.match(anglais.question, /\nTransition: SCOPING → EXPECTATION\nBrief: docs\/projects\/exemple\.md\n\nAllow this transition\?$/);
+  assert.match(movePoll(en, {}).message, /^usage: node \.githooks\/state\.mjs poll move <ACTIVITY>/);
+  const enAgent = depot({ lang: "en", config: { transitions: "agent" } });
+  assert.match(
+    movePoll(enAgent, { to: "EXPECTATION", brief: FICHE }).message,
+    /is not a human decision: `node \.githooks\/state\.mjs move EXPECTATION` is enough/,
+  );
+  assert.match(
+    (await move(en, { to: "EXPECTATION", brief: FICHE }, { tty: false })).message,
+    /; from the chat: `node \.githooks\/state\.mjs poll move EXPECTATION/,
+  );
+});
+
+test("QUA-117 : seuls les hooks des sondages drwil-move et drwil-detour appliquent la transition humaine et le oui au détour du chat", () => {
+  const PAQUET = join(RACINE_DEPOT, "packages/drwil");
+  const fichiers = [];
+  const parcourir = (dossier) => {
+    for (const e of readdirSync(dossier, { withFileTypes: true })) {
+      const chemin = join(dossier, e.name);
+      if (e.isDirectory()) parcourir(chemin);
+      else if (/\.(mjs|cjs|js|ts)$/.test(e.name) && !/\.test\.mjs$/.test(e.name)) fichiers.push(chemin);
+    }
+  };
+  for (const d of ["templates", "src", "bin"]) parcourir(join(PAQUET, d));
+  const qui = (motif) =>
+    fichiers
+      .filter((f) => motif.test(readFileSync(f, "utf8")))
+      .map((f) => f.slice(PAQUET.length + 1).replace(/\\/g, "/"))
+      .sort();
+  const HOOKS = "templates/common/tools/claude/.claude/hooks/";
+  assert.deepEqual(qui(/\bmoveFromPoll\b/), ["templates/common/base/.githooks/state-polls.mjs", `${HOOKS}move-poll.mjs`]);
+  assert.deepEqual(qui(/\ballowFromPoll\b/), ["templates/common/base/.githooks/detour.mjs", `${HOOKS}detour-poll.mjs`]);
+  // Le oui de l'humain passé à la transition sans terminal : seulement par moveFromPoll, sur la réponse lue par le hook.
+  assert.deepEqual(qui(/\bmove\([^)]*human:\s*true/), ["templates/common/base/.githooks/state-polls.mjs"]);
+});
+
+test("QUA-174 : accept au terminal : l'humain voit les critères et confirme ; sans confirmation, sans chantier ou sans critère, rien", async () => {
+  const { racine } = depotCriteres();
+  const sansChantier = await avecTerminal([], () => capturer(() => main(["accept"], racine)));
+  assert.equal(sansChantier.code, 1);
+  assert.match(sansChantier.erreurs, /aucun chantier actif/);
+
+  start(racine, FICHE, { human: true });
+  writeFileSync(join(racine, FICHE), CRITERES().replace("Un critère", "Un critère modifié"));
+  const non = await avecTerminal(["oui"], () => capturer(() => main(["accept"], racine)));
+  assert.equal(non.code, 1);
+  assert.match(non.erreurs, /acceptation non confirmée/);
+  assert.match(
+    non.sortie,
+    /^Critères de docs\/projects\/exemple\.md :\n- Un critère modifié sur deux lignes — contrat à créer\n- Autre critère/,
+  );
+  assert.equal(acceptanceCheck(racine, FICHE, readFileSync(join(racine, FICHE), "utf8")).kind, "changed");
+
+  const oui = await avecTerminal(["ACCEPT"], () => capturer(() => main(["accept"], racine)));
+  assert.equal(oui.code, 0, oui.erreurs);
+  assert.match(oui.sortie, /✓ critères de docs\/projects\/exemple\.md acceptés \(empreinte sha256:/);
+  assert.equal(acceptanceCheck(racine, FICHE, readFileSync(join(racine, FICHE), "utf8")).kind, "same");
+
+  writeFileSync(join(racine, FICHE), "# Projet : Exemple\n\n**Statut** : cadré le 2026-10-09.\n");
+  const rien = await avecTerminal([], () => capturer(() => main(["accept"], racine)));
+  assert.match(rien.erreurs, /n'a aucun critère d'acceptation/);
+  rmSync(join(racine, FICHE));
+  mkdirSync(join(racine, FICHE));
+  assert.match((await avecTerminal([], () => capturer(() => main(["accept"], racine)))).erreurs, /n'a aucun critère|aucun chantier/);
+
+  const en = depotCriteres({ lang: "en" }).racine;
+  start(en, FICHE, { human: true });
+  const enOk = await avecTerminal(["ACCEPT"], () => capturer(() => main(["accept"], en)));
+  assert.match(
+    enOk.sortie,
+    /^Criteria of docs\/projects\/exemple\.md:[\s\S]*✓ criteria of docs\/projects\/exemple\.md accepted \(fingerprint sha256:/,
+  );
+  writeFileSync(join(en, FICHE), "# Projet : Exemple\n");
+  assert.match((await avecTerminal([], () => capturer(() => main(["accept"], en)))).erreurs, /has no acceptance criteria/);
+});
+
+/** Fiche dont le bloc scope cite des hooks ; les fichiers de `.githooks/` listés existent dans le dépôt ; `corps` : texte hors du bloc. */
+function depotHooks({ lang, puces = "", scope, corps = "", existants = ["etat.mjs", "etat.test.mjs", "outil.mjs", "pose.mjs"] } = {}) {
+  const lignes = scope ?? [
+    ".githooks/etat.mjs",
+    ".githooks/etat.test.mjs",
+    "packages/kit/templates/.githooks/outil.mjs",
+    ".githooks/pose.mjs",
+    ".githooks/absent.mjs",
+    ".githooks/*.mjs",
+    "docs/x.githooks/etat.mjs",
+    "src/a.ts",
+  ];
+  const texte = `# Projet : Hooks\n\n**Statut** : cadré le 2026-10-09.\n**Maturité** : prêt\n\n<!-- scope\nfiles:\n${lignes.map((l) => `  - ${l}`).join("\n")}\n-->\n\n## Critères d'acceptation\n\n- Un critère — \`QUA-001\`\n\n## Contrats modifiés\n\n${puces}\n${corps}`;
+  const { racine, git } = depotCriteres({ lang, texte });
+  mkdirSync(join(racine, ".githooks"), { recursive: true });
+  for (const f of existants) writeFileSync(join(racine, ".githooks", f), "");
+  git("add", "-A");
+  git("commit", "-qm", "hooks");
+  return racine;
+}
+
+test("QUA-137 : le lancement nomme chaque hook existant cité par le bloc scope sans puce, tel que cité, sans jamais refuser", () => {
+  const sans = start(depotHooks({ puces: "- `.githooks/pose.mjs` — change (validé par le demandeur le 2026-10-09)" }), FICHE, {
+    human: true,
+  });
+  assert.equal(sans.code, 0, sans.message);
+  assert.match(
+    sans.message,
+    /\navertissement : le bloc scope cite `\.githooks\/etat\.mjs`, `\.githooks\/etat\.test\.mjs`, `\.githooks\/outil\.mjs` sans puce dans « Contrats modifiés »/,
+  );
+  assert.match(sans.message, /la clôture sera refusée \(QUA-137\)/);
+  assert.match(sans.message, /« - `\.githooks\/etat\.test\.mjs` — <ce qui change> \(validé par le demandeur le <date>\) »/);
+  assert.match(sans.message, /un test modifié se déclare par son nom ou par celui de son module/);
+  assert.match(sans.message, /aucune puce n'est due pour un fichier seulement mentionné dans le texte de la fiche/);
+  assert.doesNotMatch(sans.message, /pose\.mjs|absent|le cadrage cite/);
+
+  const en = start(depotHooks({ lang: "en", puces: "" }), FICHE, { human: true });
+  assert.match(
+    en.message,
+    /\nwarning: the scope block cites `\.githooks\/etat\.mjs`, `\.githooks\/etat\.test\.mjs`, `\.githooks\/outil\.mjs`, `\.githooks\/pose\.mjs` without a bullet/,
+  );
+  assert.match(en.message, /a modified test is declared by its own name or by its module's/);
+  assert.match(en.message, /no bullet is due for a file only mentioned in the brief's text/);
+
+  const tout = ["- `.githooks/etat.mjs` — a", "- `.githooks/outil.mjs` — b", "- `.githooks/pose.mjs` — c"].join("\n");
+  assert.doesNotMatch(start(depotHooks({ puces: tout }), FICHE, { human: true }).message, /avertissement/);
+});
+
+test("QUA-137 : un test cité seul est nommé comme test, et sa puce à son nom vaut au lancement comme à la clôture", () => {
+  const seulTest = depotHooks({ scope: [".githooks/etat.test.mjs"], puces: "" });
+  const message = start(seulTest, FICHE, { human: true }).message;
+  assert.match(message, /le bloc scope cite `\.githooks\/etat\.test\.mjs` sans puce/);
+  assert.doesNotMatch(message, /`\.githooks\/etat\.mjs`/);
+
+  const puce = "- `.githooks/etat.test.mjs` — attend autre chose (validé par le demandeur le 2026-10-09)";
+  const declare = depotHooks({ scope: [".githooks/etat.test.mjs"], puces: puce });
+  assert.doesNotMatch(start(declare, FICHE, { human: true }).message, /avertissement/);
+  writeFileSync(join(declare, ".githooks", "etat.test.mjs"), "// modifié\n");
+  const texte = readFileSync(join(declare, FICHE), "utf8");
+  assert.deepEqual(undeclaredHooks(declare, texte, { env: { DRWIL_BASE: "HEAD" } }).files, []);
+  assert.deepEqual(undeclaredHooks(declare, texte.replace(puce, ""), { env: { DRWIL_BASE: "HEAD" } }).files, [".githooks/etat.test.mjs"]);
+});
+
+test("QUA-137 : un hook mentionné dans le texte de la fiche, hors du bloc scope, ne déclenche aucun avertissement", () => {
+  const corps =
+    "\n## 2. Hors périmètre\n\n- `.githooks/outil.mjs` : inchangé.\n\n## 3. Contraintes\n\n- Lire `.githooks/etat.mjs` et `.githooks/etat.test.mjs`.\n";
+  const racine = depotHooks({ scope: ["src/a.ts"], corps });
+  const r = start(racine, FICHE, { human: true });
+  assert.equal(r.code, 0, r.message);
+  assert.doesNotMatch(r.message, /avertissement|\.githooks\//);
+});
+
+// --- La file attend la fusion et l'état revient en SCOPING (QUA-176 à QUA-178) ---
+
+/** Dépôt de file : état CLOSING sur la branche principale, fiche active supprimée, file [B]. */
+function depotFermeture(extra = {}) {
+  const racine = depotFile();
+  const git = (...args) => spawnSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: racine, encoding: "utf8" });
+  ecrireEtat(racine, {
+    version: 1,
+    activity: "CLOSING",
+    active_brief: "docs/projects/fini.md",
+    active_request: null,
+    since: null,
+    queue: [B],
+    ...extra,
+  });
+  prouver(racine);
+  return { racine, git, principale: git("branch", "--show-current").stdout.trim() };
+}
+const ghVide = () => "[]";
+const ghAbsent = () => null;
+
+test("QUA-176 : lire l'état en CLOSING dont la PR est fusionnée ramène en SCOPING ; ouverte, inconnue ou fiche encore là : l'état reste CLOSING", async () => {
+  const { racine, git, principale } = depotFermeture();
+  const lire = () => capturer(() => main([], racine));
+  // Sur la branche principale (fusion constatée) : retour en SCOPING, dit, file conservée, sans lancer la suivante.
+  let r = await lire();
+  assert.match(r.sortie, /^CLOSING → SCOPING : la PR du chantier est fusionnée/);
+  assert.deepEqual([readState(racine).state.activity, readState(racine).state.queue], ["SCOPING", [B]]);
+  r = await lire();
+  assert.doesNotMatch(r.sortie, /fusionnée\n/, "déjà en SCOPING : rien à dire");
+
+  // Branche de chantier : PR ouverte (gh répond sans la PR), puis gh absent ; l'état reste CLOSING et le dit.
+  ecrireEtat(racine, { version: 1, activity: "CLOSING", active_brief: "docs/projects/fini.md", active_request: null, since: null });
+  git("checkout", "-qb", "chantier");
+  writeFileSync(join(racine, "x.txt"), "x");
+  git("add", "-A");
+  git("commit", "-qm", "travail");
+  assert.match((await settleClosing(racine, { gh: ghVide })).message, /PR du chantier n'est pas fusionnée — l'état reste CLOSING/);
+  assert.match((await settleClosing(racine, { gh: ghAbsent })).message, /n'est pas établie — l'état reste CLOSING — gh injoignable/);
+  r = await lire();
+  assert.match(r.sortie, /l'état reste CLOSING/);
+  assert.equal(readState(racine).state.activity, "CLOSING");
+
+  // Fusionnée (classique) : retour ; avec un `--json` la lecture ne change pas de forme.
+  git("checkout", "-q", principale);
+  git("merge", "-q", "--no-ff", "-m", "fusion", "chantier");
+  git("checkout", "-q", "chantier");
+  assert.equal(JSON.parse((await capturer(() => main(["--json"], racine))).sortie).state.activity, "SCOPING");
+
+  // La fiche active est encore là : pas de retour.
+  ecrireEtat(racine, { version: 1, activity: "CLOSING", active_brief: A, active_request: null, since: null });
+  assert.match((await settleClosing(racine)).message, /la fiche docs\/projects\/a\.md est encore là/);
+  assert.equal(readState(racine).state.activity, "CLOSING");
+  // Hors CLOSING : rien à dire.
+  assert.equal((await settleClosing(depotFile())).message, "");
+});
+
+test("QUA-177 : next refuse de lancer la tête de file tant que la PR du chantier précédent n'est pas fusionnée ; inconnue : refus", async () => {
+  const { racine, git, principale } = depotFermeture({ activity: "SCOPING", active_brief: null });
+  // Sur la branche principale : la fusion est constatée (et sa CI prouvée verte, QUA-251).
+  prouver(racine);
+  assert.equal(nextHead(racine, { gh: ghAbsent }).code, 0);
+  assert.equal(readState(racine).state.active_brief, B);
+
+  const enCours = () =>
+    ecrireEtat(racine, { version: 1, activity: "SCOPING", active_brief: null, active_request: null, since: null, queue: [A] });
+  enCours();
+  git("checkout", "-qb", "chantier");
+  writeFileSync(join(racine, "x.txt"), "x");
+  git("add", "-A");
+  git("commit", "-qm", "travail");
+  let r = nextHead(racine, { gh: ghVide });
+  assert.equal(r.code, 1);
+  assert.match(r.message, /next refusé : la PR du chantier précédent n'est pas fusionnée/);
+  r = nextHead(racine, { gh: ghAbsent });
+  assert.match(r.message, /next refusé : la fusion de la PR du chantier précédent n'est pas établie — gh injoignable/);
+  assert.equal(readState(racine).state.activity, "SCOPING");
+  assert.equal((await capturer(() => main(["next"], racine))).code, 1, "gh ne répond pas dans ce dépôt de test");
+
+  // Dépôt sans branche principale locale (ni main ni master, pas d'origin/HEAD) : établi nulle part, refus.
+  git("branch", "-m", "tronc");
+  git("branch", "-D", principale);
+  r = nextHead(racine, { gh: ghAbsent });
+  assert.match(r.message, /next refusé : la fusion de la PR du chantier précédent n'est pas établie/);
+  assert.equal((await settleClosing(racine, { gh: ghAbsent })).message, "");
+
+  // Fusionnée : le lancement a lieu.
+  git("branch", "-m", principale);
+  git("checkout", "-qb", "autre");
+  git("merge", "-q", "chantier");
+  prouver(racine);
+  assert.equal(nextHead(racine, { gh: ghAbsent }).code, 0);
+});
+
+test("QUA-178 : la file enchaîne le chantier suivant à la fusion constatée dans la session ; une file reprise dans une nouvelle session attend le oui", async () => {
+  // Invite de la session en cours : la fusion constatée lance la tête de file, sans nouveau geste.
+  const { racine } = depotFermeture({ queue_merge: true });
+  const sortie = await capturer(() => main(["reminder"], racine));
+  assert.equal(sortie.code, 0);
+  const apres = readState(racine).state;
+  assert.deepEqual([apres.activity, apres.active_brief, apres.auto_merge], ["BUILD", B, undefined]);
+  const { message } = await settleClosing(racine, { chain: true });
+  assert.equal(message, "", "plus en CLOSING : rien à enchaîner");
+
+  // Sans file : retour en SCOPING seul. Refus de la suivante (non prête) : dit, l'état reste SCOPING.
+  const sans = depotFermeture({ queue: undefined }).racine;
+  assert.match((await settleClosing(sans, { chain: true })).message, /^CLOSING → SCOPING : la PR du chantier est fusionnée$/);
+  const pasPrete = depotFermeture({ queue: [C] }).racine;
+  const refus = (await settleClosing(pasPrete, { chain: true })).message;
+  assert.match(refus, /^CLOSING → SCOPING.*\nlancement refusé/s);
+  assert.equal(readState(pasPrete).state.activity, "SCOPING");
+
+  // Début de session (lecture simple, copilot-start, gemini-start) : retour en SCOPING, file gardée, rien de lancé.
+  for (const commande of [[], ["copilot-start"], ["gemini-start"]]) {
+    const nouvelle = depotFermeture().racine;
+    await capturer(() => main(commande, nouvelle));
+    const etat = readState(nouvelle).state;
+    assert.deepEqual([etat.activity, etat.queue], ["SCOPING", [B]], commande.join());
+  }
+  // Invites des autres outils : elles enchaînent aussi.
+  for (const commande of [["copilot-message"], ["gemini-message"]]) {
+    const outil = depotFermeture().racine;
+    await capturer(() => main(commande, outil));
+    assert.equal(readState(outil).state.activity, "BUILD", commande.join());
+  }
+});
+
+test("QUA-178 : un enchaînement refusé à l'invite (arbre sale) le dit avant le rappel, dans les trois invites", async () => {
+  const message = JSON.stringify({ prompt: "p", transformedPrompt: "bonjour" });
+  const sorties = {
+    reminder: (s) => s,
+    "copilot-message": (s) => JSON.parse(s).modifiedTransformedPrompt,
+    "gemini-message": (s) => JSON.parse(s).hookSpecificOutput.additionalContext,
+  };
+  for (const [commande, texte] of Object.entries(sorties)) {
+    const { racine } = depotFermeture();
+    writeFileSync(join(racine, "sale.txt"), "x");
+    const r = await capturer(() => main([commande], racine, Readable.from([message])));
+    assert.equal(r.code, 0, commande);
+    assert.match(
+      texte(r.sortie),
+      /CLOSING → SCOPING[\s\S]*lancement refusé : l'arbre de travail a des modifications non commitées[\s\S]*\[drwil\] Rappel/,
+      commande,
+    );
+    assert.deepEqual([readState(racine).state.activity, readState(racine).state.queue], ["SCOPING", [B]], commande);
+  }
+});
+
+test("QUA-251 : next refuse sans la preuve de CI verte sur la dernière fusion, et dit pourquoi ; un start humain n'est pas bloqué", async () => {
+  const { racine, git } = depotFermeture({ activity: "SCOPING", active_brief: null });
+  const fichier = join(racine, ".drwil", "evidence", "main-ci.json");
+  const sansPreuve = () => rmSync(fichier, { force: true });
+  // Sans preuve : refus, dit, avec la commande à lancer ; l'état reste SCOPING, file gardée.
+  sansPreuve();
+  let r = await capturer(() => main(["next"], racine));
+  assert.equal(r.code, 1);
+  assert.match(
+    r.erreurs,
+    /next refusé : aucune preuve que la CI de la branche principale est verte sur sa dernière fusion \([0-9a-f]{7}\) — lancer `node \.githooks\/pr-watch\.mjs/,
+  );
+  assert.deepEqual([readState(racine).state.activity, readState(racine).state.queue], ["SCOPING", [B]]);
+  // Preuve d'une autre fusion : la branche principale a avancé depuis.
+  prouver(racine);
+  writeFileSync(join(racine, "y.txt"), "y");
+  git("add", "-A");
+  git("commit", "-qm", "autre fusion");
+  r = nextHead(racine, { gh: ghAbsent });
+  assert.equal(r.code, 1);
+  assert.match(
+    r.message,
+    /next refusé : la CI de la branche principale suivie par pr-watch porte sur le commit [0-9a-f]{7} \(PR #1\), la branche principale à jour est à/,
+  );
+  // CI rouge, en cours, issue ouverte sur le sommet : refus qui le dit.
+  const consigner = (ci, issue) => writeProof(racine, { pr: 4, sha: mainTip(racine), ci, issue });
+  consigner("red");
+  assert.match(nextHead(racine, { gh: ghAbsent }).message, /next refusé : la CI de la branche principale est ROUGE sur sa dernière fusion/);
+  consigner("pending");
+  assert.match(nextHead(racine, { gh: ghAbsent }).message, /encore en cours.*pr-watch\.mjs 4/);
+  consigner("issue", 253);
+  assert.match(nextHead(racine, { gh: ghAbsent }).message, /l'issue #253 « CI broken on the main branch » est ouverte/);
+  assert.equal(readState(racine).state.activity, "SCOPING");
+  // Un start humain n'est pas bloqué, même sans preuve.
+  sansPreuve();
+  assert.equal(start(racine, B, { human: true }).code, 0);
+  // Preuve du sommet : next lance la tête de file.
+  ecrireEtat(racine, { version: 1, activity: "SCOPING", active_brief: null, active_request: null, since: null, queue: [A] });
+  git("checkout", "-q", "-");
+  prouver(racine);
+  r = nextHead(racine, { gh: ghAbsent });
+  assert.equal(r.code, 0, r.message);
+  // L'enchaînement à la fusion constatée (QUA-178) attend la même preuve : retour en SCOPING seul, refus dit.
+  const enchaine = depotFermeture().racine;
+  rmSync(join(enchaine, ".drwil", "evidence", "main-ci.json"));
+  const { message } = await settleClosing(enchaine, { chain: true });
+  assert.match(message, /^CLOSING → SCOPING.*\nnext refusé : aucune preuve/s);
+  assert.deepEqual([readState(enchaine).state.activity, readState(enchaine).state.queue], ["SCOPING", [B]]);
+  const anglais = depotFile({ lang: "en" });
+  ecrireEtat(anglais, { version: 1, activity: "SCOPING", active_brief: null, active_request: null, since: null, queue: [A] });
+  assert.match(nextHead(anglais, { gh: ghAbsent }).message, /^next refused: no proof that the main branch's CI is green on its last merge/);
+  // Forge non GitHub (origin ailleurs) : pas de preuve possible, next et l'enchaînement ne sont pas bloqués, la sortie le dit.
+  const ailleurs = depotFermeture({ activity: "SCOPING", active_brief: null }).racine;
+  const distant = join(tmp("drwil-gitlab-"), "depot.git");
+  spawnSync("git", ["init", "-q", "--bare", distant]);
+  spawnSync("git", ["remote", "add", "origin", distant], { cwd: ailleurs });
+  rmSync(join(ailleurs, ".drwil", "evidence", "main-ci.json"));
+  r = nextHead(ailleurs, { gh: ghAbsent });
+  assert.equal(r.code, 0, r.message);
+  assert.match(r.message, /\nfile : la forge d'origin n'est pas GitHub — pas de preuve possible .*la vérifier à la main/);
+  assert.equal(readState(ailleurs).state.active_brief, B);
+  const enchaineAilleurs = depotFermeture().racine;
+  spawnSync("git", ["remote", "add", "origin", distant], { cwd: enchaineAilleurs });
+  rmSync(join(enchaineAilleurs, ".drwil", "evidence", "main-ci.json"));
+  const chaine = (await settleClosing(enchaineAilleurs, { chain: true })).message;
+  assert.match(chaine, /^CLOSING → SCOPING.*la vérifier à la main/s);
+  assert.equal(readState(enchaineAilleurs).state.activity, "BUILD");
+});
+
+test("QUA-176 : un échec de la lecture ne casse jamais le début de session", async () => {
+  const racine = depotFile();
+  writeFileSync(join(racine, ".drwil", "state.json"), "{ pas du json");
+  assert.equal((await capturer(() => main([], racine))).code, 0);
+});
+
+// Sondage de fin de cadrage (QUA-187) : le hook du sondage, rejoué dans un projet temporaire qui porte une copie
+// des hooks de ce dépôt (le hook agit sur le dossier qui le contient, jamais sur le dépôt qui lance les tests).
+const RACINE_DEPOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+const GABARIT_CLAUDE = join(RACINE_DEPOT, "packages/drwil/templates/common/tools/claude/.claude");
+
+function projetCadrage({ branche = "cadrage/essai", lang, etat } = {}) {
+  const racine = tmp("drwil-cadrage-");
+  const copie = (de, vers) =>
+    cpSync(join(RACINE_DEPOT, de), join(racine, vers), { recursive: true, filter: (f) => !/\.test\.mjs$|__pycache__/.test(f) });
+  copie(".githooks", ".githooks");
+  copie(".claude/hooks", ".claude/hooks");
+  mkdirSync(join(racine, ".drwil"), { recursive: true });
+  if (lang) writeFileSync(join(racine, ".drwil", "ia-first.json"), JSON.stringify({ lang }));
+  if (etat) writeFileSync(join(racine, ".drwil", "state.json"), JSON.stringify(etat));
+  const git = (...a) => spawnSync("git", a, { cwd: racine, encoding: "utf8" });
+  git("init", "-q", "-b", "master");
+  git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init");
+  if (branche !== "master") git("checkout", "-q", "-b", branche);
+  return racine;
+}
+
+function hookCadrage(racine, entree) {
+  const r = spawnSync(process.execPath, [join(racine, ".claude/hooks/prompt-hook.mjs")], {
+    encoding: "utf8",
+    input: JSON.stringify(entree),
+  });
+  const contexte = r.stdout ? JSON.parse(r.stdout).hookSpecificOutput.additionalContext : "";
+  return { status: r.status, stderr: r.stderr, contexte };
+}
+
+// Le sondage `drwil-scope` d'avant (QUA-187, modifié) : posé par un ancien skill, il n'est plus ni refusé ni lu.
+const SONDAGE_CADRAGE = {
+  questions: [
+    {
+      question: "Que faire de la PR de cadrage ?",
+      header: "drwil-scope",
+      multiSelect: false,
+      options: [{ label: "Automatic merge (Recommended)" }, { label: "Manual merge" }],
+    },
+  ],
+};
+
+test("QUA-187 : le skill de cadrage met la PR de cadrage en fusion automatique par l'outil, sans sondage, cité au menu /drwil", () => {
+  const skill = readFileSync(join(GABARIT_CLAUDE, "skills/scope-a-workstream/SKILL.md"), "utf8");
+  assert.match(skill, /^---\nname: drwil-scope\ndescription: .+\. Use when .+\n---\n/);
+  const texte = skill.replace(/\s+/g, " ");
+  assert.match(texte, /without a poll/);
+  assert.doesNotMatch(texte, /AskUserQuestion|ask_user|`header`|Manual merge|Continue scoping/);
+  assert.ok(texte.indexOf("`node .githooks/merge-auto.mjs <number>`") < texte.indexOf("`node .githooks/pr-watch.mjs <number>`"));
+  assert.match(texte, /only schedules the PR of the current git branch/);
+  assert.match(texte, /never chain the forge's commands \(`gh`, `glab`\) by hand/);
+  assert.match(texte, /\*\*the same branch\*\* \(one branch, one PR, no new branch\)/);
+  const menu = readFileSync(join(GABARIT_CLAUDE, "skills/drwil/SKILL.md"), "utf8").match(/^\| `\/drwil-scope` \|.*$/m)?.[0];
+  assert.ok(menu, "/drwil-scope cité au menu /drwil");
+  // Le menu ne le décrit plus comme un sondage (QUA-187).
+  assert.match(menu, /automatic merge by the tool, without a poll/);
+  assert.doesNotMatch(menu, /poll on|manual merge|continue scoping/i);
+  // Copies installées identiques au gabarit (npm run installer-depot).
+  for (const f of ["skills/scope-a-workstream/SKILL.md", "skills/drwil/SKILL.md", "hooks/start-poll.mjs", "hooks/prompt-hook.mjs"])
+    assert.equal(readFileSync(join(RACINE_DEPOT, ".claude", f), "utf8"), readFileSync(join(GABARIT_CLAUDE, f), "utf8"), f);
+  assert.ok(!existsSync(join(RACINE_DEPOT, ".claude/hooks/merge-poll.mjs")), "plus de hook de sondage de fusion");
+});
+
+test("QUA-187 : un sondage de fin de cadrage n'est plus ni refusé ni lu : rien n'est écrit, aucune autorisation", () => {
+  const racine = projetCadrage({ etat: NEUTRAL_STATE });
+  const brut = () => readFileSync(join(racine, ".drwil", "state.json"), "utf8");
+  const avantEtat = brut();
+  const avant = hookCadrage(racine, { hook_event_name: "PreToolUse", tool_name: "AskUserQuestion", tool_input: SONDAGE_CADRAGE });
+  assert.deepEqual([avant.status, avant.stderr], [0, ""], "plus de refus du sondage de fin de cadrage");
+  const apres = hookCadrage(racine, {
+    hook_event_name: "PostToolUse",
+    tool_name: "AskUserQuestion",
+    tool_input: SONDAGE_CADRAGE,
+    tool_response: { ...SONDAGE_CADRAGE, answers: { "Que faire de la PR de cadrage ?": "Automatic merge" } },
+  });
+  assert.deepEqual([apres.status, apres.contexte], [0, ""]);
+  // Copilot CLI : un champ `drwil-scope` répondu n'est pas lu non plus.
+  hookCadrage(racine, {
+    hook_event_name: "PostToolUse",
+    tool_input: {
+      message: "drwil-scope : que faire ?",
+      requestedSchema: { properties: { "drwil-scope": { type: "string", enum: ["Automatic merge"] } } },
+    },
+    tool_result: { text_result_for_llm: "User responded: Automatic merge" },
+  });
+  assert.equal(brut(), avantEtat, "aucune réponse n'écrit l'état");
+});
+
+test("QUA-188 : une marque héritée scoping_merge reste valable en SCOPING seulement, objet { branch }", () => {
+  const racine = depot();
+  assert.deepEqual(validateState({ ...NEUTRAL_STATE, scoping_merge: { branch: "cadrage/x" } }, racine), []);
+  assert.match(validateState({ ...NEUTRAL_STATE, scoping_merge: true }, racine)[0], /scoping_merge : objet \{ branch \}/);
+  assert.match(validateState({ ...NEUTRAL_STATE, scoping_merge: { branch: "" } }, racine)[0], /scoping_merge/);
+  assert.match(
+    validateState(actif("BUILD", { scoping_merge: { branch: "cadrage/x" } }), racine)[0],
+    /scoping_merge : seulement en SCOPING/,
+  );
+});
+
+// Sondage des limites hors cadre (QUA-253) : le hook rejoué dans un projet temporaire, comme le sondage de fin de cadrage.
+const [LIMITE_A, LIMITE_B] = ["docs/intentions/limite-a.md", "docs/intentions/limite-b.md"];
+
+function projetLimites({ lang, activite = "BUILD", config } = {}) {
+  const racine = projetCadrage({ branche: "workstream/exemple", lang, etat: actif(activite) });
+  if (config) writeFileSync(join(racine, ".drwil", "ia-first.json"), JSON.stringify(config));
+  mkdirSync(join(racine, "docs/projects"), { recursive: true });
+  writeFileSync(join(racine, FICHE), "# Projet : Exemple\n");
+  return racine;
+}
+
+const questionLimite = (chemin, extra = {}) => ({
+  question: `Limite hors cadre : export CSV absent ; fichiers touchés : src/export.mjs ; deviendrait \`${chemin}\``,
+  header: "drwil-limite",
+  multiSelect: false,
+  options: [
+    { label: "Traiter maintenant", description: "cadrage élargi sur ce oui" },
+    { label: "Noter en intention", description: `fiche ${chemin}` },
+  ],
+  ...extra,
+});
+const SONDAGE_LIMITES = { questions: [questionLimite(LIMITE_A), questionLimite(LIMITE_B)] };
+const SONDAGE_LIMITES_COPILOT = (champ = { type: "string", enum: ["Traiter maintenant", "Noter en intention"] }) => ({
+  message: "drwil-limite : que faire de chaque limite hors cadre ?",
+  requestedSchema: {
+    properties: { [LIMITE_A]: champ, [LIMITE_B]: { type: "string", enum: ["Traiter maintenant", "Noter en intention"] } },
+  },
+});
+
+const reponseLimites = (racine, reponses, sondage = SONDAGE_LIMITES) =>
+  hookCadrage(racine, {
+    hook_event_name: "PostToolUse",
+    tool_name: "AskUserQuestion",
+    tool_input: sondage,
+    tool_response: {
+      ...sondage,
+      answers: Object.fromEntries(Object.entries(reponses).map(([chemin, r]) => [questionLimite(chemin).question, r])),
+    },
+  });
+
+test("QUA-253 : le hook refuse un sondage des limites prérempli, recommandé, à valeur par défaut ou mal formé", () => {
+  const racine = projetLimites();
+  const avant = (tool_input) => hookCadrage(racine, { hook_event_name: "PreToolUse", tool_name: "AskUserQuestion", tool_input });
+  assert.equal(avant(SONDAGE_LIMITES).status, 0, "une question par limite, deux réponses, rien de prérempli : posé");
+  const q = questionLimite(LIMITE_A);
+  const anglais = questionLimite(LIMITE_A, { options: [{ label: "Handle now" }, { label: "Record as intent" }] });
+  assert.equal(avant({ questions: [anglais] }).status, 0, "réponses en anglais : posé");
+  const refuses = {
+    preremplie: { ...SONDAGE_LIMITES, answers: { [q.question]: "Noter en intention" } },
+    recommandee: { questions: [{ ...q, options: [{ label: "Traiter maintenant (Recommended)" }, q.options[1]] }] },
+    "recommandée en description": {
+      questions: [{ ...q, options: [q.options[0], { label: "Noter en intention", description: "(Recommandé)" }] }],
+    },
+    "choix multiple": { questions: [{ ...q, multiSelect: true }] },
+    "une seule réponse": { questions: [{ ...q, options: [q.options[0]] }] },
+    "trois réponses": { questions: [{ ...q, options: [...q.options, { label: "Plus tard" }] }] },
+    "deux fois la même réponse": { questions: [{ ...q, options: [q.options[0], q.options[0]] }] },
+    "sans chemin d'intention": { questions: [{ ...q, question: "Limite hors cadre : export CSV absent" }] },
+    "chemin hors du dossier des intentions": { questions: [questionLimite("docs/projects/limite-a.md")] },
+    "deux chemins dans une question": { questions: [{ ...q, question: `${q.question} ou \`${LIMITE_B}\`` }] },
+    "même chemin deux fois": { questions: [q, questionLimite(LIMITE_A)] },
+    "cinq questions": { questions: ["a", "b", "c", "d", "e"].map((n) => questionLimite(`docs/intentions/${n}.md`)) },
+  };
+  for (const [cas, sondage] of Object.entries(refuses)) {
+    const r = avant(sondage);
+    assert.equal(r.status, 2, cas);
+    assert.match(r.stderr, /sondage des limites refusé/, cas);
+  }
+  // Copilot CLI : un champ par limite, choix unique (`enum` seul), jamais de valeur par défaut, de tableau ni de recommandation.
+  assert.equal(avant(SONDAGE_LIMITES_COPILOT()).status, 0);
+  const champ = { type: "string", enum: ["Traiter maintenant", "Noter en intention"] };
+  assert.equal(avant(SONDAGE_LIMITES_COPILOT({ ...champ, default: "Noter en intention" })).status, 2);
+  assert.equal(avant(SONDAGE_LIMITES_COPILOT({ type: "array", items: champ, enum: champ.enum })).status, 2);
+  assert.equal(avant(SONDAGE_LIMITES_COPILOT({ ...champ, enum: ["Traiter maintenant (Recommended)", "Noter en intention"] })).status, 2);
+  // Le dossier des intentions suit la configuration (`dirs.intentions`).
+  const autre = projetLimites({ config: { dirs: { intentions: "notes/intentions" } } });
+  const avantAutre = (tool_input) => hookCadrage(autre, { hook_event_name: "PreToolUse", tool_name: "AskUserQuestion", tool_input });
+  assert.equal(avantAutre({ questions: [questionLimite("notes/intentions/x.md")] }).status, 0);
+  assert.equal(avantAutre(SONDAGE_LIMITES).status, 2);
+  // En anglais selon la langue du projet ; un autre sondage passe sans rien changer.
+  assert.match(
+    hookCadrage(projetLimites({ lang: "en" }), { hook_event_name: "PreToolUse", tool_input: refuses.preremplie }).stderr,
+    /limits poll refused/,
+  );
+  assert.equal(avant({ questions: [{ ...q, header: "autre" }] }).status, 0);
+});
+
+test("QUA-253 : la réponse humaine, lue par le hook, est enregistrée dans l'état pour chaque limite", () => {
+  const racine = projetLimites();
+  const limites = () => readState(racine).state.limits;
+  let r = reponseLimites(racine, { [LIMITE_A]: "Traiter maintenant", [LIMITE_B]: "Noter en intention" });
+  assert.match(
+    r.contexte,
+    /^\[drwil\] ✓ réponses de l'humain au sondage des limites enregistrées : docs\/intentions\/limite-a\.md → « Traiter maintenant » ; docs\/intentions\/limite-b\.md → « Noter en intention »/,
+  );
+  assert.deepEqual(limites(), [
+    { intent: LIMITE_A, choice: "now" },
+    { intent: LIMITE_B, choice: "note" },
+  ]);
+  // Une nouvelle réponse pour un chemin remplace la précédente ; une question sans réponse n'est pas enregistrée et le hook le dit.
+  r = reponseLimites(racine, { [LIMITE_A]: "Noter en intention" });
+  assert.match(r.contexte, /Sans réponse lue, non enregistrée\(s\), à soumettre de nouveau : docs\/intentions\/limite-b\.md/);
+  assert.deepEqual(limites(), [
+    { intent: LIMITE_B, choice: "note" },
+    { intent: LIMITE_A, choice: "note" },
+  ]);
+  // Aucune réponse, ou une réponse libre : rien n'est enregistré, l'état est inchangé.
+  const avant = readFileSync(join(racine, ".drwil", "state.json"), "utf8");
+  assert.match(reponseLimites(racine, {}).contexte, /✗ aucune réponse lue dans le sondage des limites/);
+  assert.match(
+    reponseLimites(racine, { [LIMITE_A]: "Je ne sais pas" }, { questions: [questionLimite(LIMITE_A)] }).contexte,
+    /✗ aucune réponse lue/,
+  );
+  assert.equal(readFileSync(join(racine, ".drwil", "state.json"), "utf8"), avant);
+  // Copilot CLI : réponse en texte libre, un champ par limite.
+  const copilot = projetLimites();
+  hookCadrage(copilot, {
+    hook_event_name: "PostToolUse",
+    tool_input: SONDAGE_LIMITES_COPILOT(),
+    tool_result: { text_result_for_llm: `User responded: ${LIMITE_A}=Noter en intention, ${LIMITE_B}=Traiter maintenant` },
+  });
+  assert.deepEqual(readState(copilot).state.limits, [
+    { intent: LIMITE_A, choice: "note" },
+    { intent: LIMITE_B, choice: "now" },
+  ]);
+  // Hors de BUILD à CLOSING : rien n'est enregistré, l'état est inchangé.
+  const cadrage = projetCadrage();
+  assert.match(
+    reponseLimites(cadrage, { [LIMITE_A]: "Traiter maintenant" }).contexte,
+    /✗ réponse au sondage des limites ignorée : l'activité est SCOPING/,
+  );
+  assert.equal(readState(cadrage).state.limits, undefined);
+  // En CLOSING (refus de clôture), la réponse s'enregistre ; en anglais selon la langue du projet.
+  const cloture = projetLimites({ activite: "CLOSING" });
+  assert.match(reponseLimites(cloture, { [LIMITE_A]: "Record as intent" }).contexte, /✓ /);
+  assert.deepEqual(readState(cloture).state.limits, [{ intent: LIMITE_A, choice: "note" }]);
+  assert.match(
+    reponseLimites(projetLimites({ lang: "en" }), { [LIMITE_A]: "Handle now", [LIMITE_B]: "Record as intent" }).contexte,
+    /the human's answers to the limits poll recorded: docs\/intentions\/limite-a\.md → « Handle now »/,
+  );
+});
+
+test("QUA-253 : champ limits valable de BUILD à CLOSING, liste de { intent, choice }, un chemin une fois", () => {
+  const racine = depot();
+  const ok = [{ intent: LIMITE_A, choice: "now" }];
+  for (const a of ["BUILD", "EVIDENCE", "VERIFY", "CLOSING"]) assert.deepEqual(validateState(actif(a, { limits: ok }), racine), [], a);
+  assert.match(validateState({ ...NEUTRAL_STATE, limits: ok }, racine)[0], /limits : liste de \{ intent, choice \}/);
+  for (const limits of [
+    true,
+    [{ intent: LIMITE_A, choice: "plus tard" }],
+    [{ intent: "docs/intentions/x", choice: "now" }],
+    [{ intent: LIMITE_A, choice: "now", recommande: true }],
+    [...ok, { intent: LIMITE_A, choice: "note" }],
+  ])
+    assert.match(validateState(actif("BUILD", { limits }), racine)[0] ?? "", /limits/, JSON.stringify(limits));
+});
+
+test("QUA-253 : le contexte de BUILD dit la règle des limites et liste les réponses ; elles tombent au retour en SCOPING", () => {
+  const racine = depot({ state: actif("BUILD", { limits: [{ intent: LIMITE_A, choice: "note" }] }) });
+  const texte = context(readState(racine), racine);
+  assert.match(texte, /Limites : une limite dans le cadre \(bloc scope, contrats déclarés\) se traite sur le champ, jamais notée/);
+  assert.match(texte, /sondage `drwil-limite` lu par le hook/);
+  assert.match(texte, /« Traiter maintenant » et « Noter en intention », aucune recommandée ni remplie/);
+  assert.match(texte, /Un sous-agent ne pose pas le sondage : il s'arrête avec la liste des limites hors cadre/);
+  assert.match(
+    texte,
+    /Réponses de l'humain aux limites hors cadre \(sondage `drwil-limite`\) : docs\/intentions\/limite-a\.md → « Noter en intention »/,
+  );
+  // Hors de BUILD : les réponses seules, pas la règle ; sans réponse, pas de liste.
+  const verif = depot({ state: actif("VERIFY", { limits: [{ intent: LIMITE_A, choice: "now" }] }) });
+  assert.doesNotMatch(context(readState(verif), verif), /Limites : une limite/);
+  assert.match(context(readState(verif), verif), /limite-a\.md → « Traiter maintenant »/);
+  assert.doesNotMatch(context(readState(depot({ state: actif("BUILD") })), racine), /Réponses de l'humain aux limites/);
+  // En anglais.
+  const en = depot({ lang: "en", state: actif("BUILD", { limits: [{ intent: LIMITE_A, choice: "now" }] }) });
+  assert.match(context(readState(en), en), /Limits: a limit within the scope .* is handled on the spot, never recorded/);
+  assert.match(context(readState(en), en), /limite-a\.md → « Handle now »/);
+  // Retour en SCOPING : état neutre, les réponses tombent.
+  const t = prepareTransition(readState(racine), "SCOPING", { now: MAINTENANT }, racine);
+  assert.equal(t.state.limits, undefined);
+});
+
+test("QUA-253 : recordLimits, appelée par le hook : de BUILD à CLOSING, la dernière réponse d'un chemin remplace la précédente", async () => {
+  const racine = depot({ state: actif("BUILD") });
+  assert.deepEqual(["Traiter maintenant", "noter en intention", " Handle now ", "Record as intent", "Autre", undefined].map(limitChoice), [
+    "now",
+    "note",
+    "now",
+    "note",
+    null,
+    null,
+  ]);
+  assert.equal(intentPath(racine, `deviendrait \`${LIMITE_A}\` (voir ${LIMITE_A})`), LIMITE_A);
+  assert.equal(intentPath(racine, `${LIMITE_A} ou ${LIMITE_B}`), null, "deux chemins : aucun");
+  assert.equal(intentPath(racine, "docs/projects/x.md"), null);
+  assert.equal(intentPath(racine, undefined), null);
+  const autre = depot({ config: { dirs: { intentions: "notes/intentions/" } } });
+  assert.equal(intentPath(autre, "deviendrait notes/intentions/x.md"), "notes/intentions/x.md");
+  let r = await recordLimits(racine, [{ intent: LIMITE_A, choice: "now" }]);
+  assert.equal(r.code, 0);
+  assert.match(r.message, /limite-a\.md → « Traiter maintenant »/);
+  await recordLimits(racine, [
+    { intent: LIMITE_B, choice: "note" },
+    { intent: LIMITE_A, choice: "note" },
+  ]);
+  assert.deepEqual(readState(racine).state.limits, [
+    { intent: LIMITE_B, choice: "note" },
+    { intent: LIMITE_A, choice: "note" },
+  ]);
+  r = await recordLimits(depot({ lang: "en", state: actif("EVIDENCE") }), [{ intent: LIMITE_A, choice: "note" }]);
+  assert.match(r.message, /limite-a\.md → « Record as intent »/);
+  // Un état invalide n'est jamais réécrit ; hors de BUILD à CLOSING, rien n'est écrit.
+  const invalide = depot({ state: "{ pas du json" });
+  r = await recordLimits(invalide, [{ intent: LIMITE_A, choice: "now" }]);
+  assert.equal(r.code, 1);
+  assert.match(r.message, /illisible/);
+  assert.equal(readFileSync(join(invalide, ".drwil", "state.json"), "utf8"), "{ pas du json");
+  r = await recordLimits(depot({ state: NEUTRAL_STATE }), [{ intent: LIMITE_A, choice: "now" }]);
+  assert.match(r.message, /l'activité est SCOPING/);
+});
+
+test("QUA-036 : le rappel de BUILD et les règles de conduite disent la règle des limites — dans le cadre, traitée ; hors cadre, sondage avant VERIFY", () => {
+  const racine = depot({ state: actif("BUILD") });
+  assert.match(
+    context(readState(racine), racine),
+    /une limite dans le cadre \(bloc scope, contrats déclarés\) se traite sur le champ, jamais notée ; une limite hors cadre est soumise à l'humain, une fois, à la fin de BUILD et avant VERIFY, par un sondage `drwil-limite`/,
+  );
+  const en = depot({ lang: "en", state: actif("BUILD") });
+  assert.match(
+    context(readState(en), en),
+    /a limit within the scope .* is handled on the spot, never recorded; a limit outside it goes to the human, once, at the end of BUILD and before VERIFY, by a `drwil-limite` poll/,
+  );
+  // Règles de conduite : celles du dépôt (français) et celles du gabarit livré (anglais).
+  const lire = (chemin) => readFileSync(fileURLToPath(new URL(`../${chemin}`, import.meta.url)), "utf8");
+  assert.match(
+    lire("AGENTS.md"),
+    /une limite dans le cadre se traite sur le champ ; hors cadre, l'humain choisit par un sondage `drwil-limite`, à la fin de BUILD et avant VERIFY ; seule « Noter en intention » en fait une fiche d'intention/,
+  );
+  const gabarit = "packages/drwil/templates/common/base/";
+  assert.match(
+    lire(`${gabarit}AGENTS.md`),
+    /a limit within the scope is handled on the spot; outside it, the human chooses by a `drwil-limite` poll, at the end of BUILD and before VERIFY; only « Record as intent » makes it an intent brief/,
+  );
+  for (const regles of [lire(`${gabarit}docs/ia-first/8-conduct-rules.md`), lire("docs/ia-first/8-conduct-rules.md")]) {
+    assert.match(
+      regles.replace(/\s+/g, " "),
+      /a limit within the brief's scope \(scope block, declared contracts\) is handled on the spot, never recorded; a limit outside it goes to the human, once, at the end of BUILD and before VERIFY, by a `drwil-limite` poll/,
+    );
+    assert.match(regles.replace(/\s+/g, " "), /each limit answered « Record as intent » becomes an intent brief/);
+  }
+});
+
+/** QUA-040 : dépôt git temporaire, branche `chantier` partie de master, fiche donnée à `close --check`. */
+function depotChangelog({ lang, changelog } = {}) {
+  const racine = tmp("drwil-unreleased-");
+  const git = (...args) => {
+    const r = spawnSync("git", ["-c", "user.name=t", "-c", "user.email=t@t.invalid", "-c", "core.hooksPath=/dev/null", ...args], {
+      cwd: racine,
+      encoding: "utf8",
+    });
+    assert.equal(r.status, 0, `git ${args.join(" ")} : ${r.stderr}`);
+  };
+  const ecrire = (fichiers) => {
+    for (const [chemin, contenu] of Object.entries(fichiers)) {
+      mkdirSync(dirname(join(racine, chemin)), { recursive: true });
+      writeFileSync(join(racine, chemin), contenu);
+    }
+  };
+  git("init", "-q", "-b", "master");
+  ecrire({
+    ".drwil/ia-first.json": JSON.stringify({ ...(lang ? { lang } : {}), contractPrefixes: ["QUA"] }),
+    ".gitignore": ".drwil/state.json\n.drwil/evidence/\n",
+    "docs/projects/exemple.md": "# Projet : Exemple\n",
+    "src/a.mjs": "export const a = 0;\n",
+    ...(changelog ? { [changelog]: "# Changelog\n\n## Unreleased\n\n## 1.0.0\n\n- Début.\n" } : {}),
+  });
+  git("add", "-A");
+  git("commit", "-q", "-m", "initial");
+  git("checkout", "-q", "-b", "chantier");
+  const verifier = () => close(racine, { brief: "docs/projects/exemple.md", check: true, lookCi: () => ({ state: "none" }) });
+  return { racine, git, ecrire, verifier };
+}
+
+test("QUA-040 : close --check signale, sans bloquer, une branche qui change du code livré sans toucher « Unreleased » ; sans changelog, rien", () => {
+  const avertit =
+    /Avertissements \(non bloquants\) :\n {2}⚠ CHANGELOG\.md : la branche change du code livré \(src\/a\.mjs\) sans ligne sous « Unreleased »/;
+  const sans = depotChangelog();
+  sans.ecrire({ "src/a.mjs": "export const a = 1;\n" });
+  assert.doesNotMatch(sans.verifier().message, /Unreleased/, "sans changelog, aucun signal");
+
+  const d = depotChangelog({ changelog: "CHANGELOG.md" });
+  d.ecrire({ "src/a.mjs": "export const a = 1;\n" });
+  d.git("commit", "-qam", "code");
+  const r = d.verifier();
+  assert.equal(r.code, 0, "le signal ne bloque pas");
+  assert.match(r.message, avertit);
+  d.ecrire({ "CHANGELOG.md": "# Changelog\n\n## Unreleased\n\n## 1.0.0\n\n- Début.\n- Ajout tardif.\n" });
+  assert.match(d.verifier().message, avertit, "une ligne hors de « Unreleased » ne compte pas");
+  d.ecrire({ "CHANGELOG.md": "# Changelog\n\n## Unreleased\n\n- Nouveau.\n\n## 1.0.0\n\n- Début.\n" });
+  assert.doesNotMatch(d.verifier().message, /Unreleased/, "ligne sous « Unreleased », même non commitée");
+
+  const doc = depotChangelog({ changelog: "CHANGELOG.md" });
+  doc.ecrire({ "src/a.test.mjs": "test;\n", "docs/guide.md": "# Guide\n", "README.md": "# Lisez-moi\n", ".githooks/h.mjs": "//\n" });
+  assert.doesNotMatch(doc.verifier().message, /Unreleased/, "tests, Markdown, docs/ et dossiers en point : pas du code livré");
+});
+
+test("QUA-040 : le changelog d'un paquet ne couvre que son dossier ; message en anglais", () => {
+  const d = depotChangelog({ lang: "en", changelog: "packages/p/CHANGELOG.md" });
+  d.ecrire({ "src/a.mjs": "export const a = 1;\n" });
+  assert.doesNotMatch(d.verifier().message, /Unreleased/, "hors du dossier du paquet");
+  d.ecrire({ "packages/p/src/b.mjs": "export const b = 1;\n" });
+  assert.match(
+    d.verifier().message,
+    /Warnings \(non-blocking\):\n {2}⚠ packages\/p\/CHANGELOG\.md: the branch changes shipped code \(packages\/p\/src\/b\.mjs\) without a line under « Unreleased »/,
+  );
+  d.ecrire({ "packages/p/c.mjs": "1\n", "packages/p/d.mjs": "1\n", "packages/p/e.mjs": "1\n" });
+  assert.match(
+    d.verifier().message,
+    /\(packages\/p\/c\.mjs, packages\/p\/d\.mjs, packages\/p\/e\.mjs, … \(4\)\)/,
+    "trois fichiers cités, puis le nombre",
+  );
+});
+
+test("QUA-040 : changelog né sur la branche ou sans section « Unreleased », branche principale absente", () => {
+  const neuf = depotChangelog();
+  neuf.ecrire({ "src/a.mjs": "export const a = 1;\n", "CHANGELOG.md": "# Changelog\n\n## 1.0.0\n" });
+  assert.match(neuf.verifier().message, /CHANGELOG\.md : la branche change du code livré \(src\/a\.mjs\)/, "sans section : signalé");
+  neuf.ecrire({ "CHANGELOG.md": "# Changelog\n\n## Unreleased\n\n- Nouveau.\n" });
+  assert.doesNotMatch(neuf.verifier().message, /Unreleased/, "né sur la branche avec sa ligne");
+  neuf.git("branch", "-q", "-m", "master", "ancienne");
+  assert.doesNotMatch(neuf.verifier().message, /Unreleased/, "sans branche principale, rien à comparer");
+});
+
+// --- Historique des transitions du chantier en cours (QUA-305) ---
+
+test("QUA-305 : le lancement ouvre l'historique, chaque transition y ajoute son activité et son instant, le retour en SCOPING compris", async () => {
+  const { racine } = depotCadre();
+  assert.equal(start(racine, FICHE, { human: true, now: "2026-11-15T09:00:00Z" }).code, 0);
+  assert.deepEqual(readState(racine).state.history, [{ activity: "BUILD", at: "2026-11-15T09:00:00Z" }]);
+  const etapes = [
+    ["EVIDENCE", "2026-11-15T10:00:00Z"],
+    ["BUILD", "2026-11-15T10:30:00Z"],
+    ["EVIDENCE", "2026-11-15T11:00:00Z"],
+    ["VERIFY", "2026-11-15T11:10:00Z"],
+  ];
+  for (const [to, now] of etapes) assert.equal((await move(racine, { to }, { tty: false, now })).code, 0, to);
+  // CLOSING demande une preuve de verify : la transition préparée suffit à montrer l'entrée ajoutée.
+  const cloture = prepareTransition(readState(racine), "CLOSING", { now: "2026-11-15T11:20:00Z" }, racine);
+  assert.deepEqual(cloture.state.history.at(-1), { activity: "CLOSING", at: "2026-11-15T11:20:00Z" });
+  assert.equal((await move(racine, { to: "SCOPING" }, { tty: false, now: "2026-11-15T12:00:00Z" })).code, 0);
+  const lu = readState(racine);
+  assert.deepEqual(lu.problems, []);
+  assert.equal(lu.state.activity, "SCOPING");
+  assert.deepEqual(lu.state.history, [
+    { activity: "BUILD", at: "2026-11-15T09:00:00Z" },
+    ...etapes.map(([activity, at]) => ({ activity, at })),
+    { activity: "SCOPING", at: "2026-11-15T12:00:00Z" },
+  ]);
+  // Le chantier suivant repart d'un historique neuf.
+  assert.equal(start(racine, FICHE, { human: true, now: "2026-11-16T09:00:00Z" }).code, 0);
+  assert.deepEqual(readState(racine).state.history, [{ activity: "BUILD", at: "2026-11-16T09:00:00Z" }]);
+});
+
+test("QUA-305 : un état antérieur sans historique reste valide ; sa transition suivante en ouvre un, jamais reconstruit", async () => {
+  const racine = depot({ state: actif("BUILD") });
+  const lu = readState(racine);
+  assert.deepEqual(lu.problems, []);
+  assert.equal(lu.state.history, undefined);
+  assert.equal((await move(racine, { to: "EVIDENCE" }, { tty: false, now: MAINTENANT })).code, 0);
+  assert.deepEqual(readState(racine).state.history, [{ activity: "EVIDENCE", at: MAINTENANT }]);
+});
+
+test("QUA-305 : la réouverture ajoute à l'historique une entrée BUILD marquée", () => {
+  const { racine } = depotClos();
+  const historique = [
+    { activity: "BUILD", at: "2026-10-09T10:00:00Z" },
+    { activity: "CLOSING", at: "2026-10-09T11:00:00Z" },
+  ];
+  writeState(racine, { ...readState(racine).state, history: historique });
+  const { gh } = ghSimule(racine, PR_OUVERTE);
+  assert.equal(reopen(racine, { gh, now: MAINTENANT }).code, 0);
+  assert.deepEqual(readState(racine).state.history, [...historique, { activity: "BUILD", at: MAINTENANT, reopened: true }]);
+});
+
+test("QUA-305 : un historique mal formé rend l'état invalide, dit dans la langue du projet", () => {
+  const racine = depot();
+  const ok = [
+    { activity: "BUILD", at: "2026-10-09T10:00:00Z" },
+    { activity: "BUILD", at: "2026-10-09T11:00:00Z", reopened: true },
+  ];
+  assert.deepEqual(validateState(actif("BUILD", { history: ok }), racine), []);
+  assert.deepEqual(validateState({ ...NEUTRAL_STATE, history: ok }, racine), [], "gardé au retour en SCOPING");
+  for (const mauvais of [
+    "BUILD",
+    [{ activity: "CODAGE", at: "2026-10-09T10:00:00Z" }],
+    [{ activity: "BUILD", at: "hier" }],
+    [{ activity: "BUILD" }],
+    [{ activity: "BUILD", at: "2026-10-09T10:00:00Z", reopened: false }],
+    [{ activity: "BUILD", at: "2026-10-09T10:00:00Z", message: "contenu" }],
+    [null],
+  ]) {
+    assert.match(validateState(actif("BUILD", { history: mauvais }), racine).join(" ; "), /« history »/, JSON.stringify(mauvais));
+  }
+  assert.match(validateState(actif("BUILD", { history: "x" }), depot({ lang: "en" })).join(" ; "), /"history" must be a list/);
+});

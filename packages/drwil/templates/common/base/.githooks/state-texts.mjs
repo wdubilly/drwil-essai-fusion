@@ -1,0 +1,114 @@
+// Texts of the governance state and their layout for the agent (split from state.mjs, which
+// re-exports them): full context and short reminder, built from the state already read and the disk.
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { readBlock } from "./scope.mjs";
+import { config } from "./briefs.mjs";
+import { worktreeLines } from "./worktree.mjs";
+import { TEXTS } from "./state-context-texts.mjs";
+import { lotLabel, lotStatus } from "./state-lots.mjs";
+import { limitLines } from "./state-limits.mjs";
+import { changeForge } from "./close-checks.mjs";
+
+import { fill, STATE_MESSAGES } from "./state-messages.mjs";
+
+export { fill, STATE_MESSAGES };
+
+const language = (root) => (config(root).lang === "en" ? "en" : "fr");
+
+/** Language of what a visitor reads (map, README, changelog): `docLang`, else the project's (QUA-040). */
+export const docLanguage = (root) => config(root).docLang ?? config(root).lang ?? "fr";
+
+/** `scopeGate: off` switches off all governance (gate, trailer, context): withdrawal without deleting anything. */
+export const governanceDisabled = (root) => config(root).scopeGate === "off";
+
+/** The change request as its forge names it (QUA-116): « MR !n » on GitLab, « PR #n » otherwise. */
+const changeRef = (root, n) => (changeForge(root) === "gitlab" ? `MR !${n}` : `PR #${n}`);
+
+/** Lines of a brief with lots: the current lot to work on alone (BUILD), the [human] lots to do (BUILD, CLOSING). */
+function lotContext(read, root, T) {
+  const status = lotStatus(root, read);
+  if (!status) return [];
+  const { activity } = read.state;
+  const lines = [];
+  if (activity === "BUILD") lines.push(T.lot(lotLabel(status.current), status.current === status.ia.at(-1)));
+  if (status.humans.length && (activity === "BUILD" || activity === "CLOSING"))
+    lines.push(T.lotHumans(status.humans.map(lotLabel).join(" ; ")));
+  return lines;
+}
+
+/** Readable context to reinject to the agent, built from the disk only. */
+export function context(read, root) {
+  const T = TEXTS[language(root)];
+  if (governanceDisabled(root)) return T.disabled;
+  const { state, source, problems } = read;
+  const lines = [T.header];
+  if (source === "missing") lines.push(T.missing);
+  if (problems.length) lines.push(T.invalid, ...problems.map((p) => `  - ${p}`));
+  lines.push(T.activity(state.activity));
+  let brief = state.active_brief;
+  let patterns = null;
+  if (brief && !existsSync(join(root, brief))) {
+    brief = `${brief} — ${T.briefDeleted}`;
+  } else if (brief) {
+    try {
+      const text = readFileSync(join(root, brief), "utf8");
+      const title = /^#\s+(.+)$/m.exec(text)?.[1]?.trim();
+      if (title) brief = `${brief} — ${title}`;
+      patterns = readBlock(text).patterns;
+    } catch {
+      patterns = [];
+    }
+  }
+  lines.push(T.brief(brief), T.request(state.active_request));
+  // The automatic merge is the default (QUA-163): the closing instruction is given to any workstream, without a mark;
+  // not once a failed reopening cancelled it (QUA-181): rescheduling it is then up to the human.
+  if (state.activity !== "SCOPING" && !state.merge_cancelled) lines.push(T.autoMerge);
+  // End-of-scoping poll answered « Automatic merge » (QUA-188): the scoping PR of that branch only.
+  if (state.scoping_merge) lines.push(fill(STATE_MESSAGES[language(root)].scopingMergeReminder, state.scoping_merge.branch));
+  if (state.queue?.length) lines.push(fill(T.queue, state.queue.join(", ")));
+  if (state.queue_draft?.length) lines.push(fill(T.queueDraft, state.queue_draft.join(", ")));
+  if (state.parallel?.length) lines.push(fill(T.parallel, state.parallel.join(", ")));
+  if (state.queue?.length && state.activity === "SCOPING") lines.push(fill(T.queueResume, state.queue[0]));
+  if (state.detour) lines.push(fill(T.detour, state.detour.origin_brief, state.detour.origin_branch, state.detour.branch));
+  if (state.reopened) lines.push(fill(T.reopened, changeRef(root, state.reopened.pr)));
+  if (state.merge_cancelled) lines.push(fill(T.mergeCancelled, changeRef(root, state.merge_cancelled.pr)));
+  if (patterns) lines.push(T.scope, ...(patterns.length ? patterns.map((p) => `  - ${p}`) : [T.noScope]));
+  lines.push(...lotContext(read, root, T));
+  // Limits (QUA-253): within the scope, handled on the spot; outside it, the human's poll before VERIFY.
+  lines.push(...limitLines(state, STATE_MESSAGES[language(root)], language(root)));
+  lines.push(T.rule(T.rules[state.activity]));
+  if (state.activity === "CLOSING") lines.push(T.docLanguage(docLanguage(root)));
+  if (state.activity === "CLOSING" && !state.queue?.length) lines.push(T.closingNoQueue);
+  // Back in SCOPING by a move (`since` set; a missing state has none), outside a queue: one session per workstream (QUA-131).
+  if (state.activity === "SCOPING" && state.since && !state.queue?.length) lines.push(T.nextSession);
+  lines.push(...worktreeLines(root));
+  lines.push(T.footer);
+  return lines.join("\n");
+}
+
+/** Short reminder (two lines) of the state, to inject with each message; null if governance is disabled. */
+export function shortReminder(read, root) {
+  const T = TEXTS[language(root)];
+  if (governanceDisabled(root)) return null;
+  const { state, problems } = read;
+  const head = problems.length
+    ? T.invalidReminder
+    : (() => {
+        let n = null;
+        if (state.active_brief && !existsSync(join(root, state.active_brief))) {
+          return T.reminder(state.activity, `${state.active_brief} (${T.briefDeleted})`, null);
+        }
+        if (state.active_brief) {
+          try {
+            n = readBlock(readFileSync(join(root, state.active_brief), "utf8")).patterns.length;
+          } catch {
+            n = 0;
+          }
+        }
+        return T.reminder(state.activity, state.active_brief, n);
+      })();
+  const lot = problems.length ? [] : lotContext(read, root, T);
+  const cancelled = !problems.length && state.merge_cancelled ? [fill(T.mergeCancelled, changeRef(root, state.merge_cancelled.pr))] : [];
+  return [head, ...lot, ...cancelled, T.rule(T.rules[state.activity])].join("\n");
+}

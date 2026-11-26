@@ -1,0 +1,132 @@
+// Presentation of the `drwil verify` verdict for an agent (Claude, Codex, Cursor…), tied to no
+// particular agent. Pure adapter: it only reads verify's v1 JSON (verdictJson) and recomputes no rule.
+// It never runs `drwil attest`: it presents the attestation as a human action, chat poll first, terminal as fallback. Output in English, stable whatever
+// the project's language (consumed by agents).
+import { durabilityHint } from "./criteria.js";
+import { rulesLine } from "./rules.js";
+import { labelIds, PARTIAL_LABEL, PENDING_LABEL } from "./verdict.js";
+import type { verdictJson } from "./verify.js";
+
+type VerdictJson = ReturnType<typeof verdictJson>;
+
+const CONDUCT: Record<string, string> = {
+  pass: "Work is verified by drwil. You may continue or finish the task.",
+  fail: "Work is NOT verified. Fix the failing contracts below, then run `drwil verify` again. Do not claim the work is done.",
+  error: "drwil could not establish the verdict. Report the verification problem to the human; do not claim the work is verified.",
+  partial:
+    "This is a partial verdict (--failed): the contracts not replayed are not judged. Work is NOT verified. Fix the failing contracts, replay with `drwil verify --failed`, then run the full pass `drwil verify --evidence`.",
+  manual:
+    "Work is NOT verified yet. Stop claiming validation and ask the human to attest the contracts below: the attestation poll in the chat first, the terminal as fallback.",
+  // QUA-260: never « Work is verified » under a PASS (CI pending).
+  ciPending:
+    "Work is NOT verified yet: the checks left to CI have not run here. You may continue, but do not claim the work is verified until the PR or MR CI is green on them (`node .githooks/pr-watch.mjs <number>`).",
+};
+
+// QUA-267: the chat poll first, the terminal as fallback; the agent prepares the poll, only the human answers it.
+const ATTEST_STEPS = [
+  "HUMAN ACTION — first, the attestation poll in the chat: prepare it with",
+  '  drwil attest-poll <CONTRACT_ID> --tried "<what you tried>"',
+  "and ask it unchanged through the tool's poll, no answer, default or recommendation added (recipe docs/recipes/attest-a-contract.md); only the human answers it.",
+  "Fallback, for the human in their own interactive terminal; never run it yourself:",
+  "  drwil attest <CONTRACT_ID>",
+];
+
+const LABELS: Record<string, string> = {
+  pass: "GOVERNANCE: PASS",
+  fail: "GOVERNANCE: FAIL",
+  error: "GOVERNANCE: VERIFY ERROR",
+  manual: "GOVERNANCE: MANUAL REVIEW REQUIRED",
+};
+
+// QUA-140, QUA-141: each contract says, per check, whether its verdict was taken from `run-checks` (identical tree, or the files of the
+// check alone) or replayed (either language of the reasons).
+const REUSED = /: (repris|reused) \(/;
+const REUSED_CONTROL = /: (repris|reused) \((fichiers du contrôle inchangés|check files unchanged)\)/;
+const REPLAYED = /: (rejoué|replayed)$/;
+
+export function formatForAgent(j: VerdictJson): string {
+  const c = j.contracts;
+  const l = [
+    "drwil verify — result for the agent",
+    `Contracts: ${c.passed} PASS · ${c.attested} ATTESTED · ${c.failed} FAIL · ${c.error} ERROR · ${c.manual} MANUAL (${c.total} total)`,
+    `Verdict: ${j.label ?? (j.status === "partial" ? PARTIAL_LABEL : (LABELS[j.status] ?? j.status))} (exit ${j.exitCode})`,
+    ...(j.ciPending.length
+      ? [`Note: Checks left to CI, not run here and never counted as passed — pending the PR or MR CI: ${j.ciPending.join(", ")}`]
+      : []),
+    ...reuseLine(j),
+    `Next step: ${(j.label === PENDING_LABEL ? CONDUCT.ciPending : CONDUCT[j.status]) ?? CONDUCT.error}`,
+    ...partialLines(j),
+  ];
+  if (j.status === "pass" && c.attested)
+    l.push(`Note: ${c.attested} contract(s) are satisfied by a human attestation, not by an automated proof.`);
+  const blocking = j.results.filter((r) => r.severity === "blocking");
+  const list = (status: string) => blocking.filter((r) => r.status === status);
+  for (const [status, title] of [
+    ["fail", "Failing contracts (fix them)"],
+    ["error", "Contracts drwil could not verify"],
+  ] as const) {
+    if (!list(status).length) continue;
+    l.push("", `${title}:`);
+    // Successful checks are noise here, in either language of the reasons.
+    for (const r of list(status))
+      l.push(
+        `  - ${r.id} — ${r.title}: ${r.reasons.filter((x) => !/ok \((automatisé|automated)\)$/.test(x) && !REUSED.test(x) && !REPLAYED.test(x)).join(" ; ")}`,
+      );
+  }
+  const unproven = j.criteria.filter((c) => c.status !== "pass");
+  if (unproven.length) {
+    l.push("", "Unproven acceptance criteria of the active brief (each one needs a passing contract):");
+    for (const c of unproven) {
+      const hint = durabilityHint(c, "en");
+      l.push(`  - « ${c.text} » — ${c.link ?? "no proof"}: ${c.status}${c.human ? " (human)" : ""}${hint ? ` — ${hint}` : ""}`);
+    }
+  }
+  const broken = j.closureProofs ?? [];
+  if (broken.length) {
+    l.push(
+      "",
+      "Criteria of closed workstreams whose proof has disappeared (closing proof replayed): restore the proof, never the proof file alone.",
+    );
+    for (const c of broken) l.push(`  - ${c.workstream} « ${c.text} » — ${c.link ?? "no proof"}: ${c.status} (${c.file})`);
+  }
+  const manual = list("manual");
+  if (manual.length) {
+    l.push("", "Human attestation required.");
+    for (const r of manual)
+      l.push(`  - ${r.id} — ${r.title}${r.attestable ? "" : " (not attestable as is: needs a human decision first)"}`);
+    l.push(...ATTEST_STEPS, "Then run `drwil verify` again.");
+  }
+  const informational = j.results.filter((r) => r.severity !== "blocking" && r.status !== "pass" && r.status !== "attested");
+  if (informational.length)
+    l.push("", `Non-blocking (informational): ${informational.map((r) => `${r.id} ${r.status.toUpperCase()}`).join(", ")}`);
+  if (j.errors.length) l.push("", "Registry errors:", ...j.errors.map((e) => `  - ${e}`));
+  const rules = rulesLine(j.businessRules, "en");
+  if (rules) l.push("", rules);
+  return labelIds(l.join("\n"), j.results);
+}
+
+function partialLines(j: VerdictJson): string[] {
+  const p = "partial" in j ? j.partial : undefined;
+  if (!p) return [];
+  if (!p.previous) return ["Partial: no readable previous evidence in .drwil/evidence/, nothing replayed. Run `drwil verify --evidence`."];
+  return [
+    `Partial: ${p.replayed.length} contract(s) replayed (outcome of the replayed ones: ${p.outcome}), ${p.skipped} PASS or ATTESTED at ${p.previous} not replayed, so not judged.`,
+    ...(p.manual.length
+      ? [`Awaiting attestation, not failing, not replayed: ${p.manual.join(", ")} — HUMAN ACTION:`, ...ATTEST_STEPS]
+      : []),
+  ];
+}
+
+function reuseLine(j: VerdictJson): string[] {
+  const reasons = j.results.flatMap((r) => r.reasons);
+  const control = reasons.filter((x) => REUSED_CONTROL.test(x)).length;
+  const reused = reasons.filter((x) => REUSED.test(x)).length - control;
+  const replayed = reasons.filter((x) => REPLAYED.test(x)).length;
+  if (!(reused + control + replayed)) return [];
+  const line = `Checks (per contract): ${reused} reused from run-checks on an identical tree, ${replayed} replayed`;
+  return control
+    ? [
+        `${line}, ${control} reused from run-checks on unchanged check files (per-check reuse: not a closing proof; \`verify --evidence\` replays on the whole tree)`,
+      ]
+    : [line];
+}

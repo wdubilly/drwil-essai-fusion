@@ -1,0 +1,65 @@
+{
+  "description": "drwil : état de gouvernance, rappels et attestation humaine par request_user_input. Revoir et approuver les hooks dans /hooks.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^(request_user_input|Bash)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$(git rev-parse --show-toplevel)/.claude/hooks/prompt-hook.mjs\" codex",
+            "commandWindows": "powershell -NoProfile -Command \"& node (Join-Path (git rev-parse --show-toplevel) '.claude/hooks/prompt-hook.mjs') codex; exit $LASTEXITCODE\"",
+            "timeout": 600
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^request_user_input$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$(git rev-parse --show-toplevel)/.claude/hooks/prompt-hook.mjs\" codex",
+            "commandWindows": "powershell -NoProfile -Command \"& node (Join-Path (git rev-parse --show-toplevel) '.claude/hooks/prompt-hook.mjs') codex; exit $LASTEXITCODE\"",
+            "timeout": 600
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$(git rev-parse --show-toplevel)/.githooks/state.mjs\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$(git rev-parse --show-toplevel)/.claude/hooks/serve-welcome.mjs\"",
+            "commandWindows": "powershell -NoProfile -Command \"& node (Join-Path (git rev-parse --show-toplevel) '.claude/hooks/serve-welcome.mjs'); exit $LASTEXITCODE\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$(git rev-parse --show-toplevel)/.githooks/state.mjs\" reminder",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

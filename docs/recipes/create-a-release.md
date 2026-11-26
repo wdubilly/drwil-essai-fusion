@@ -1,0 +1,151 @@
+# Recipe: create a release (tag + GitHub note)
+
+Goal: mark a merged workstream with a Git tag (`vX.Y.Z`) and a release
+note, without publishing to npm and without committing any file
+(compatible with a "no direct commit on the main branch" contract, if
+adopted).
+
+This is **not installed by default** in the kit's template: the script
+is an optional module, like the dashboard — see the README in
+`templates/common/optional/create-release/` (module shipped by the kit
+package). On this repository, it is already activated as
+`.githooks/create-release.mjs`. Like a commit or a push, this script only
+runs on the user's explicit request, never on its own in CI.
+
+## Publication green light
+
+Creating the release (step 3 below) posts a tag and a note that everyone
+sees: by default it is a gesture **after agreement** — the agent shows
+the `--dry-run` result and waits for the human's yes before creating
+anything.
+
+The human can give that yes **at launch** instead, so that a queue of
+workstreams run by sub-agents (which cannot ask a question) publishes
+without stopping: an explicit sentence in the request that launches the
+workstream or the queue, naming the version — e.g. « publication green
+light: v1.4.0 ». The agent that orchestrates passes it verbatim to the
+sub-agent in charge of the release. With that green light, the agent
+runs the `--dry-run`, then creates the release only if the computed
+version is the one named and the script refused nothing; otherwise, or
+without a green light, it stops after the `--dry-run` and gives the human
+the exact command to run. The green light covers one release, never the
+following ones, and never an npm publication (see « Assumed limits »).
+
+## Required OS: green CI before the release
+
+On this repository, `release.requiredOs` in `.drwil/ia-first.json` lists
+`ubuntu-latest`, `windows-latest` and `macos-latest`: a pull request and a
+push on master only test Ubuntu (QUA-045), the three OS are tested on a
+release tag and on a manual run of the workflow.
+`node .githooks/create-release.mjs` (direct release or `--candidate`) and
+`node .githooks/promote-release.mjs` refuse,
+without creating any tag or release, as long as one of those OS has no
+successful CI job that really ran its test steps on the commit concerned
+(`HEAD`, or the candidate's commit); a job whose test steps were skipped
+never counts, nor in the acceptance sheet. The refusal names the missing
+OS and the command; `gh` unavailable is a refusal too, never a release
+guessed green; `--dry-run` says it without refusing. The setting is
+absent by default in the kit's template (an update never adds it). The
+order is then:
+
+1. Run the workflow on the commit to release:
+   `gh workflow run ia-first.yml --ref master`.
+2. Wait for the three OS to be green on that commit (`gh run watch`).
+3. Create the release (method below). A candidate's tag push also runs
+   the three OS on its commit: wait for it before the promotion.
+
+## Method (once the module is activated)
+
+1. Preview without creating anything: `node .githooks/create-release.mjs
+   --dry-run` — shows the last tag, the detected bump (major/minor/patch)
+   and the next version.
+2. The version: when there are publishable npm packages (tracked
+   package.json, with a `name`, without `"private": true`), the tag is
+   **`v` + their `version`** — single source, decided in a PR with
+   `npm version patch|minor|major --no-git-tag-version`. The script refuses
+   (exit 1, `--dry-run` included) a tag that already exists, a version that
+   does not increase, or packages that disagree. Without an npm package,
+   the version is computed *best-effort* from commit messages since the
+   last tag, Conventional-Commits style (`feat:` → minor, announced
+   breaking change → major, otherwise patch by default); with packages,
+   that computation is only a displayed suggestion. In the same PR, if the
+   project keeps a `CHANGELOG.md` (if present), its « Unreleased » section, fed by the
+   last increment of each workstream's BUILD, is renamed to that version (a new empty
+   « Unreleased » above it).
+3. Create for real, after the human's agreement or with the green light
+   given at launch (see above): `node .githooks/create-release.mjs`
+   (annotated tag pushed to `origin`, then `gh release create
+   --generate-notes` if `gh` is available and authenticated).
+4. If the repo contains one or more publishable npm packages (tracked
+   package.json, with a `name`, without `"private": true`), a tarball
+   (`npm pack`) is built for each and attached as a downloadable asset on
+   the GitHub release — handy to hand the package to someone to try
+   without publishing to npm (that is the case of `packages/drwil` on this
+   repository). `--dry-run` lists the packages that would be packed
+   without building anything.
+5. Wrong version for once (miscalculated tag): delete the tag (`git tag
+   -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z`) and rerun once the
+   fix is in place — never rewrite shared history.
+
+## Acceptance before publication (candidate, verdict, promotion)
+
+When an acceptance team that does not read the repository validates each
+version, its approval conditions the publication: it tests the tarball
+before the final release.
+
+1. Candidate: `node .githooks/create-release.mjs --candidate --dry-run`
+   shows the version and the generated acceptance sheet without building
+   or publishing anything; without `--dry-run` (after the human's yes or
+   the publication green light, as above), the tag `vX.Y.Z-rc.N` is pushed
+   and a GitHub **pre-release** carries the tarball and the sheet (attached
+   and as its note). The sheet is generated, never written by hand: on top,
+   the points to validate (human criteria of each brief in its last
+   version, known limits — « not tried for real yet » when the limit says
+   so —, attestations to redo), each with a stable ID `vX.Y.Z-P<n>` and its
+   workstream's PR; below, the non-regression already proven (`drwil
+   verify` verdict, not counting the rule against direct work on the main
+   branch where the release is created, contracts proven by a test, OS
+   tested by the CI, tarball fingerprint).
+2. Verdict — **a human gesture, never run by an agent**, like `drwil
+   attest`: `node .githooks/release-verdict.mjs vX.Y.Z-rc.N --approve`, or
+   `--reserve <point>` / `--refuse <point>` for each point concerned. It is
+   recorded on the pre-release with who gave it and when (no commit); each
+   reserve and each refusal becomes an issue, which the agent sorts with
+   the recipe « fix a defect » (defect to fix or intent).
+   From the chat (Claude Code), the human gives the same verdict by
+   answering a poll: the agent prepares it with
+   `node .githooks/release-verdict-poll.mjs vX.Y.Z-rc.N` and the same
+   options (it runs the same checks and writes nothing), then asks the
+   printed `drwil-verdict` poll unchanged, with no answer, default or
+   recommendation. Only the human's answer, read by the hook, records the
+   verdict, as in the terminal; a sheet changed during the question records
+   nothing. The terminal stays possible. Under Copilot CLI, the printed
+   poll goes through `node .claude/hooks/copilot-polls.mjs` (pipe) and its
+   output is given to `ask_user` as is.
+3. Promotion: `node .githooks/promote-release.mjs vX.Y.Z-rc.N --dry-run`,
+   then without `--dry-run` (same green light as a release). Refused
+   without a verdict or when refused; otherwise the final release `vX.Y.Z`
+   is created on the same commit with the same tarball (fingerprint
+   checked), the reserves listed in its note. It becomes `releases/latest`,
+   which never shows a pre-release: link a README there once, with no
+   commit at each version.
+4. Acceptance note: right after the release, the promotion opens a pull
+   request carrying the version note, one file per version, named after it, in the `recettes` folder under `docs` (sheet, verdict, reserves,
+   who and when, tarball fingerprint) on a dedicated branch
+   `recette/vX.Y.Z` — built without touching the working tree, the index
+   or the current branch, and never overwriting an existing remote branch.
+   The tag and the release never depend on that PR: if it fails, the script
+   says so with the catch-up command (`node .githooks/recette-note.mjs
+   vX.Y.Z <note file>`, or `gh pr create` when only the PR failed) and the
+   note is kept in a file. A version released directly, without a
+   candidate, gets the same note marked « without verdict » (with a « to
+   complete » block for the human); `--dry-run` shows the note without
+   creating any branch or PR.
+
+## Assumed limits
+
+- Designed for GitHub (`gh release create`); on GitLab, only the Git tag
+  is posted by the script, the release note still needs to be created
+  via the GitLab Releases API (best-effort, not covered).
+- Never publishes to npm: a separate decision, out of scope for this
+  recipe.

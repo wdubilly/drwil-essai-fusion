@@ -1,0 +1,82 @@
+# Intention : une vue de relecture — ce qui demande le jugement humain
+
+**Statut** (2026-10-09) : à cadrer — intention posée par le demandeur,
+questions à trancher en fin de fiche.
+Rangement du 2026-10-26 : la relecture avant fusion, qui n'avait qu'une ligne d'index, est reprise en fin de fichier.
+**Revu le 2026-11-13** : toujours vivante. Devenu faux dans « Existant » : le module du tableau de bord s'appelle `dashboard` (skill `drwil-progress`), dont le retrait est envisagé (`docs/intentions/retrait-de-drwil-progress.md`) ; `drwil serve` (QUA-277) donne depuis le 2026-11-08 une vue en direct du projet, base possible pour la question 1 (forme). Voisine : la fiche cadrée `docs/projects/relecture-critique-avant-cloture.md` (une relecture critique par un agent avant la clôture) couvre une partie de la question « relecture avant fusion » en fin de fichier, pas la vue humaine. La question `drwil-review` du sondage n'existe pas.
+
+**Projet** : DRWIL — **Cible** : après la gouvernance (machine d'état et
+double barrière) — **Niveau de risque** : MEDIUM.
+
+## Besoin
+
+Le 2026-10-09, la PR de la gouvernance (45 fichiers, environ 3 500 lignes)
+a été fusionnée par le demandeur « sur la confiance » : la relire en entier
+n'avait pas de sens, et rien ne montrait **ce qui demandait son jugement**.
+Tout ce que produit le travail d'un agent est pourtant versionné et
+vérifiable (fiches, décisions, cadrage, attestations, évidence de verify,
+trailers `Drwil-Attente`), mais dispersé.
+
+Le principe directeur de drwil — « l'agent peut réaliser le travail ; il
+ne peut pas définir seul les conditions dans lesquelles ce travail est
+considéré comme acceptable » — suppose que l'humain puisse **voir et
+valider ces conditions** en quelques minutes. Sans cette vue, la relecture
+humaine, dernier mot de la chaîne de confiance, se réduit à un acte de foi.
+
+Intention : une vue qui réponde à « qu'est-ce que je dois valider dans
+cette PR (ou ce chantier) ? », en 5 à 10 points précis plutôt qu'un diff.
+
+## Ce que la vue pourrait rassembler
+
+- **Décisions** ajoutées ou modifiées dans les fiches (les choix du
+  demandeur, tels que rédigés par l'agent) : sont-elles fidèles ?
+- **Élargissements de cadrage** : quels fichiers l'agent s'est autorisé à
+  toucher, dans quels commits.
+- **Ce qui change les règles du jeu** : hooks, règles `deny`, réglages
+  `barriere` et `transitions`, contrats, seuils.
+- **Preuves** : verdict de `drwil verify`, contrats attestés plutôt que
+  prouvés, ce que l'agent a déclaré non testé.
+- **Exceptions** : contrôles non exécutés, pushes hors hooks, écarts
+  signalés et mis en attente.
+
+## Existant
+
+- Tableau de bord statique, module optionnel (`visualiser-avancement`) :
+  avancement des chantiers et couverture des contrats, en HTML, sans
+  serveur ni déploiement.
+- `drwil verify --agent` : verdict et actions humaines attendues.
+- Barrière de périmètre : rejoue chaque commit d'une branche contre le
+  cadrage de sa fiche (base pour lister les élargissements).
+- Hors périmètre de la gouvernance : « Dashboard UI » — c'est donc un
+  sujet distinct.
+
+## Contraintes
+
+- Aucun contrôle mécanique ne doit consommer de tokens ni dépendre de
+  l'affirmation d'un agent : la vue se calcule depuis Git et les fichiers
+  versionnés.
+- Pas de serveur ni de SaaS imposés par défaut (cohérence avec le reste du
+  kit).
+- Agnostique de l'outil d'agent.
+
+## Questions à trancher
+
+1. **Forme** : page statique générée (comme le tableau de bord), commentaire
+   automatique sur la PR, sortie de `drwil` dans le terminal, ou
+   application interactive (« backoffice ») ?
+2. **Granularité** : par PR (diff de branche), par chantier (fiche), ou les
+   deux ?
+3. **Articulation** avec le tableau de bord existant : extension du module
+   ou outil séparé ?
+4. **Validation** : la vue sert-elle seulement à lire, ou enregistre-t-elle
+   aussi une validation humaine point par point (comme `drwil attest`) ?
+5. **Livrable** : outil du dépôt drwil seulement, ou livré dans le gabarit
+   (QUA-018, périmètre dépôt / gabarit) ?
+
+## Reprises du rangement du 2026-10-26
+
+### relecture avant fusion, choisie au lancement (ex-ligne de l'index)
+
+**Besoin** :
+
+Une question de plus dans le sondage (`drwil-review` : aucune, relecture par un agent, relecture humaine), indépendante de la fusion automatique ou manuelle ; combinaison fusion automatique + relecture humaine refusée ; touche le sondage, l'état local, la recette de clôture et le gabarit. À cadrer avec la vue de relecture et la protection de master (décision antérieure, reprise de `docs/projects/pending.md`).

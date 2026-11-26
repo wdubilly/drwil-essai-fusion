@@ -1,0 +1,56 @@
+# Intention : sept retours du demandeur à traiter en 0.11.2
+
+**Statut** : cadrée le 2026-11-12 — retours du demandeur, tous en 0.11.2, chacun cadré en fiche P0 (`docs/projects/`).
+
+## Existant
+
+- Le sondage `drwil-merge` (« Automatic merge » / « Manual merge ») était lu par le module `state-merge`, supprimé le 2026-11-13 (la fusion automatique est devenue le comportement par défaut, sans sondage) ; le skill `start-a-workstream` le décrit.
+- Le suivi de consommation (`drwil-usage`, `.drwil/usage.jsonl`) lit les sessions de Claude Code et de Copilot CLI (depuis le 2026-11-15) ; les autres outils s'estiment à la main.
+- Le skill `start-a-workstream` lance un sous-agent par lot (Claude Code et Copilot CLI).
+- `drwil init` écrit des lignes d'index et de lots que l'on voit en `[humain]` là où un `[IA]` est attendu (`packages/drwil/src/guarantees-briefs.ts` produit des lignes `[humain]`).
+- La priorité d'une fiche est une simple convention (`[P0]` à `[P3]`), sans analyse.
+
+## Besoin
+
+### 1. Mesurer la consommation sur Copilot
+
+Aujourd'hui seul Claude Code est mesuré. Trouver comment recueillir (ou centraliser) la consommation de Copilot CLI et la faire remonter dans `.drwil/usage.jsonl` et le tableau de bord.
+- Décidé le 2026-11-12 : journaux de session locaux de Copilot CLI, en jetons comme Claude Code ; un fichier par dépôt (`.drwil/usage.jsonl`).
+- Fait : chantier « la consommation de Copilot CLI est mesurée comme celle de Claude Code », clos le 2026-11-15 (voir `docs/projects/journal.md`) ; plus rien à cadrer ici.
+
+### 2. Analyser l'urgence avant de prioriser une fiche
+
+Toujours prioriser une fiche en P0 sans se demander si elle peut attendre. Il faut une analyse qui dit si elle peut attendre ou non.
+- Tranché, voir la fiche : Forme : questions fixes au cadrage (bloque-t-elle un adoptant ? casse-t-elle la CI ? contournement possible ?), ou contrôle de `check-docs`.
+- Tranché, voir la fiche : Où se consigne le résultat (champ de la fiche, ligne de l'index).
+
+### 3. Fichier neuf couvert par la PR
+
+Déjà traité : QUA-173, chantier fusionné par #409. Le défaut de couverture de `closedBriefPatterns` qui restait a été traité par son chantier, clos le 2026-11-12 (voir `docs/projects/journal.md`). Rien d'autre à cadrer ici.
+
+### 4. Fusion automatique par défaut
+
+Retirer le sondage `drwil-merge` : la fusion automatique devient le comportement par défaut.
+- Décidé le 2026-11-12 : inconditionnelle, sans réglage pour la refuser ; les sondages `drwil-merge` et `drwil-scope` disparaissent.
+- Fait : chantier « la fusion automatique est le comportement par défaut, sans sondage », clos le 2026-11-14 (voir `docs/projects/journal.md`) ; plus rien à cadrer ici.
+
+### 5. Relecteur critique, ou test de qualité et fonctionnel
+
+Un skill ou un relecteur de code critique, sans être trop astreignant, compatible avec l'objectif « full auto ».
+- Tranché, voir la fiche : Forme : skill de relecture avant clôture (avis, non bloquant), test fonctionnel du critère, ou les deux.
+- Tranché, voir la fiche : Bloquant ou consultatif ; modèle et coût acceptables.
+
+### 6. `init` : transitions en [humain] au lieu de [IA]
+
+Traité le 2026-11-12 par le chantier « `drwil init` marque [IA] ce qu'un agent peut faire » (`docs/projects/journal.md`, entrée du 2026-11-12 « init marque [IA] ce qu'un agent peut faire ») : reproduit sur un projet neuf (`init` puis `guarantees`), les fiches de garantie et leurs lignes d'index portent `[IA]`, sauf le versionnement (réglé sur la forge) gardé `[humain]` ; titre français « Incréments ». Rien d'autre à cadrer ici.
+
+### 7. `start` et les sous-agents
+
+- **7a** : traité le 2026-11-12 par le chantier « le lancement dit pourquoi il est refusé » (`docs/projects/journal.md`, entrée du 2026-11-12 « Un lancement refusé le dit ») : tout refus de lancement, arbre sale compris, est dit à l'invite comme au sondage. Rien d'autre à cadrer ici.
+- **7b** : arrêter de travailler en sous-agent, qui semblerait plus consommateur.
+  - Décidé le 2026-11-12 : supprimer les sous-agents du skill `start-a-workstream` maintenant, sans mesure préalable ; le chantier se fait dans la session principale.
+  - Cette règle de l'`AGENTS.md` change, validée par le demandeur : un lot par session ou par `lot next` reste à décider (reprise via « Reprise » de la fiche).
+
+## Questions à trancher
+
+- Aucune : chaque point est cadré en fiche (voir l'index, section « Fiches cadrées »), décisions tranchées le 2026-11-12.

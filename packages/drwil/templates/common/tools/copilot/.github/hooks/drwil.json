@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "bash": "command -v node >/dev/null || { echo 'drwil: node not found in the PATH of this assistant. Restart it from a shell where which node answers.' >&2; exit 0; }; node .githooks/state.mjs copilot-start",
+        "powershell": "if (Get-Command node -ErrorAction SilentlyContinue) { node .githooks/state.mjs copilot-start } else { [Console]::Error.WriteLine('drwil: node not found in the PATH of this assistant. Restart it from a shell where which node answers.') }",
+        "cwd": ".",
+        "timeoutSec": 10
+      },
+      {
+        "type": "command",
+        "bash": "command -v node >/dev/null || { echo 'drwil: node not found in the PATH of this assistant. Restart it from a shell where which node answers.' >&2; exit 0; }; node .claude/hooks/serve-welcome.mjs copilot",
+        "powershell": "if (Get-Command node -ErrorAction SilentlyContinue) { node .claude/hooks/serve-welcome.mjs copilot } else { [Console]::Error.WriteLine('drwil: node not found in the PATH of this assistant. Restart it from a shell where which node answers.') }",
+        "cwd": ".",
+        "timeoutSec": 15
+      }
+    ],
+    "preToolUse": [
+      {
+        "type": "command",
+        "bash": "command -v node >/dev/null || { echo 'drwil: node not found in the PATH of this assistant. Restart it from a shell where which node answers.' >&2; exit 0; }; node .claude/hooks/prompt-hook.mjs copilot pre",
+        "powershell": "if (Get-Command node -ErrorAction SilentlyContinue) { node .claude/hooks/prompt-hook.mjs copilot pre } else { [Console]::Error.WriteLine('drwil: node not found in the PATH of this assistant. Restart it from a shell where which node answers.') }",
+        "cwd": ".",
+        "timeoutSec": 120
+      }
+    ],
+    "postToolUse": [
+      {
+        "type": "command",
+        "bash": "command -v node >/dev/null || { echo 'drwil: node not found in the PATH of this assistant. Restart it from a shell where which node answers.' >&2; exit 0; }; node .claude/hooks/prompt-hook.mjs copilot post",
+        "powershell": "if (Get-Command node -ErrorAction SilentlyContinue) { node .claude/hooks/prompt-hook.mjs copilot post } else { [Console]::Error.WriteLine('drwil: node not found in the PATH of this assistant. Restart it from a shell where which node answers.') }",
+        "cwd": ".",
+        "timeoutSec": 120
+      }
+    ],
+    "postToolUseFailure": [
+      {
+        "type": "command",
+        "bash": "command -v node >/dev/null || { echo 'drwil: node not found in the PATH of this assistant. Restart it from a shell where which node answers.' >&2; exit 0; }; node .claude/hooks/prompt-hook.mjs copilot post",
+        "powershell": "if (Get-Command node -ErrorAction SilentlyContinue) { node .claude/hooks/prompt-hook.mjs copilot post } else { [Console]::Error.WriteLine('drwil: node not found in the PATH of this assistant. Restart it from a shell where which node answers.') }",
+        "cwd": ".",
+        "timeoutSec": 120
+      }
+    ],
+    "userPromptTransformed": [
+      {
+        "type": "command",
+        "bash": "command -v node >/dev/null || { echo 'drwil: node not found in the PATH of this assistant. Restart it from a shell where which node answers.' >&2; exit 0; }; node .githooks/state.mjs copilot-message",
+        "powershell": "if (Get-Command node -ErrorAction SilentlyContinue) { node .githooks/state.mjs copilot-message } else { [Console]::Error.WriteLine('drwil: node not found in the PATH of this assistant. Restart it from a shell where which node answers.') }",
+        "cwd": ".",
+        "timeoutSec": 10
+      }
+    ]
+  }
+}

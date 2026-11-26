@@ -1,0 +1,1305 @@
+import { afterEach, test } from "node:test";
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { allow, contractsAddedOnly } from "./detour.mjs";
+import { readState } from "./state.mjs";
+import { addTrailer, checkScope, outsideBriefFiles, checkIndex } from "./scope-gate.mjs";
+import { TEXTS } from "./scope-gate-texts.mjs";
+import { kitPaths, nonKitFiles } from "./scope-gate-kit.mjs";
+import { derivation, derivedInWorktree } from "./scope-derived.mjs";
+
+// Un hook lancé par `git commit -a` ou depuis un worktree reçoit GIT_INDEX_FILE, GIT_DIR… :
+// hérités, ils font agir les dépôts de test, et le code testé, sur le dépôt qui lance les tests.
+for (const nom of Object.keys(process.env)) if (nom.startsWith("GIT_")) delete process.env[nom];
+
+// Chaque dossier temporaire est supprimé après son test : ces tests tournent à chaque commit,
+// et aussi dans chaque projet que génèrent les tests du kit ; sans ça, ils épuisaient les
+// inodes de /tmp. Ceux d'un test en échec sont gardés
+// (et affichés) pour le diagnostic.
+let dossiersDuTest = [];
+const tmp = (prefixe) => {
+  const dir = mkdtempSync(join(tmpdir(), prefixe));
+  dossiersDuTest.push(dir);
+  return dir;
+};
+afterEach((t) => {
+  if (t.passed === false) console.error(`dossiers gardés pour diagnostic (${t.name}) : ${dossiersDuTest.join(", ")}`);
+  else {
+    for (const dir of dossiersDuTest) {
+      // macOS (CI) : ENOTEMPTY possible pendant la suppression ; rmSync réessaie. Un dossier
+      // résiduel ne doit pas faire échouer un test réussi : signalé.
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      } catch (e) {
+        console.error(`dossier temporaire non supprimé (${t.name}) : ${dir} — ${e.code ?? e.message}`);
+      }
+    }
+  }
+  dossiersDuTest = [];
+});
+
+const FICHE = "docs/projects/exemple.md";
+const fiche = (motifs) =>
+  `# Projet : Exemple\n\n**Statut** : cadré le 2026-10-09.\n\n<!-- scope\nfiles:\n${motifs.map((m) => `  - ${m}`).join("\n")}\n-->\n`;
+
+function git(racine, ...args) {
+  const r = spawnSync("git", args, { cwd: racine, encoding: "utf8" });
+  assert.equal(r.status, 0, `git ${args.join(" ")} : ${r.stderr}`);
+  return r.stdout.trim();
+}
+
+function ecrire(racine, chemin, contenu) {
+  mkdirSync(dirname(join(racine, chemin)), { recursive: true });
+  writeFileSync(join(racine, chemin), contenu);
+}
+
+/** Dépôt dont le premier commit contient la barrière (marqueur) et la fiche cadrée. */
+function depot(motifs = ["src/a.js"]) {
+  const racine = tmp("drwil-perimetre-");
+  git(racine, "init", "-q", "-b", "main");
+  git(racine, "config", "user.email", "test@example.invalid");
+  git(racine, "config", "user.name", "Test");
+  ecrire(racine, ".githooks/scope-gate.mjs", "// marqueur : barrière en vigueur\n");
+  ecrire(racine, FICHE, fiche(motifs));
+  git(racine, "add", ".");
+  git(racine, "commit", "-q", "-m", "base");
+  return racine;
+}
+
+const etat = (activite) => ({
+  version: 1,
+  activity: activite,
+  active_brief: activite === "SCOPING" ? null : FICHE,
+  active_request: null,
+  since: null,
+});
+const ecrireEtat = (racine, activite) => ecrire(racine, ".drwil/state.json", JSON.stringify(etat(activite)));
+
+test("hors fiches : seules les fiches, les attestations et le journal de consommation échappent au périmètre", () => {
+  assert.deepEqual(
+    outsideBriefFiles([
+      "docs/projects/x.md",
+      "docs/intentions/y.md",
+      "docs/projects/z.md",
+      ".drwil/evidence/attestations/QUA-013-2026-10-09T17-56-29-571Z.json",
+      ".drwil/usage.jsonl",
+      "README.md",
+      "src/a.js",
+    ]),
+    ["README.md", "src/a.js"],
+  );
+  // Attestations et consommation seulement : le reste de .drwil/ (réglages, évidences locales) reste soumis.
+  assert.deepEqual(outsideBriefFiles([".drwil/ia-first.json", ".drwil/evidence/verify-x.json"]), [
+    ".drwil/ia-first.json",
+    ".drwil/evidence/verify-x.json",
+  ]);
+  assert.deepEqual(outsideBriefFiles(["docs/autre.md"], ["docs/*"]), [], "liste réglable");
+});
+
+test("QUA-035 : hors fiches : les sorties des recettes de cadrage (valeur, risques, en français et en anglais) aussi, rien d'autre de docs/", () => {
+  // Constaté le 2026-10-17 : la découverte de valeur, faite en SCOPING, y était refusée au commit.
+  assert.deepEqual(
+    outsideBriefFiles([
+      "docs/decouverte-valeur.md",
+      "docs/value-discovery.md",
+      "docs/audit-risques.md",
+      "docs/audit-risks.md",
+      "docs/architecture.md",
+      "docs/decouverte-valeur-bis.md",
+    ]),
+    ["docs/architecture.md", "docs/decouverte-valeur-bis.md"],
+  );
+});
+
+test("QUA-035 : hors fiches : la note de recette d'une version, commitée par plomberie sans trailer, rien d'autre de docs/", () => {
+  // Constaté le 2026-10-22 : la CI refusait le commit de la note de recette de la v0.6.10 (PR #199).
+  assert.deepEqual(outsideBriefFiles(["docs/recettes/v0.6.10.md", "docs/recettes-bis.md"]), ["docs/recettes-bis.md"]);
+});
+
+test("QUA-084 : hors fiches : la preuve de clôture, écrite en CLOSING pour le commit de clôture", () => {
+  // Constaté le 2026-10-21 : la clôture écrivait sa preuve, puis la barrière refusait de la commiter.
+  assert.deepEqual(outsideBriefFiles(["docs/preuves/x.md", "docs/preuves/README.md", "docs/preuve.md"]), ["docs/preuve.md"]);
+  assert.deepEqual(checkIndex({ files: [FICHE, "docs/preuves/x.md"], state: etat("CLOSING"), patterns: [] }), []);
+});
+
+test("index : fiches toujours acceptées, le reste seulement en BUILD et dans le cadrage", () => {
+  const motifs = ["src/a.js"];
+  assert.deepEqual(checkIndex({ files: [FICHE], state: etat("SCOPING"), patterns: [] }), []);
+  // La ligne de consommation s'écrit en CLOSING, pour le commit de clôture.
+  assert.deepEqual(checkIndex({ files: [FICHE, ".drwil/usage.jsonl"], state: etat("CLOSING"), patterns: [] }), []);
+  assert.match(checkIndex({ files: ["src/a.js"], state: etat("SCOPING"), patterns: motifs })[0], /SCOPING/);
+  assert.match(checkIndex({ files: ["src/a.js"], state: etat("EVIDENCE"), patterns: motifs })[0], /BUILD/);
+  assert.deepEqual(checkIndex({ files: ["src/a.js", FICHE], state: etat("BUILD"), patterns: motifs }), []);
+  const hors = checkIndex({ files: ["src/a.js", "src/b.js", "README.md"], state: etat("BUILD"), patterns: motifs });
+  assert.equal(hors.length, 2);
+  assert.match(hors.join("\n"), /src\/b\.js/);
+  assert.match(hors.join("\n"), /README\.md/);
+});
+
+test("pre-commit : le cadrage est lu dans HEAD, pas dans l'index (élargir = commit séparé)", () => {
+  const racine = depot();
+  ecrireEtat(racine, "BUILD");
+  ecrire(racine, "src/a.js", "a\n");
+  git(racine, "add", "src/a.js");
+  assert.deepEqual(checkScope(racine, { cfg: { scopeGate: "blocking" }, staged: ["src/a.js"] }).problems, []);
+  // Élargir le cadrage et l'utiliser dans le même commit : refusé.
+  ecrire(racine, FICHE, fiche(["src/a.js", "src/b.js"]));
+  ecrire(racine, "src/b.js", "b\n");
+  const r = checkScope(racine, { cfg: { scopeGate: "blocking" }, staged: [FICHE, "src/b.js"] });
+  assert.equal(r.status, "fail");
+  assert.match(r.problems.join("\n"), /src\/b\.js/);
+});
+
+test("QUA-035 : pre-commit : un fichier du gabarit cadré couvre sa copie déclarée (scopeMirrors), pas une autre", () => {
+  const racine = depot();
+  ecrireEtat(racine, "BUILD");
+  const cfg = { scopeGate: "blocking", scopeMirrors: [{ from: "src/", to: "copie/" }] };
+  assert.deepEqual(checkScope(racine, { cfg, staged: ["copie/a.js"] }).problems, [], "copie de src/a.js, cadré");
+  assert.match(checkScope(racine, { cfg, staged: ["copie/b.js"] }).problems.join("\n"), /copie\/b\.js/, "copie d'un fichier non cadré");
+  assert.match(
+    checkScope(racine, { cfg: { scopeGate: "blocking" }, staged: ["copie/a.js"] }).problems.join("\n"),
+    /copie\/a\.js/,
+    "sans réglage",
+  );
+});
+
+test("pre-commit sans état : SCOPING neutre, un fichier hors fiches est refusé", () => {
+  const racine = depot();
+  const r = checkScope(racine, { cfg: { scopeGate: "blocking" }, staged: ["src/a.js"] });
+  assert.equal(r.status, "fail");
+  assert.match(r.problems[0], /SCOPING/);
+});
+
+test("sévérité : off ne contrôle rien, avertissement signale sans bloquer", () => {
+  const racine = depot();
+  assert.equal(checkScope(racine, { cfg: { scopeGate: "off" }, staged: ["src/a.js"] }).status, "not-applicable");
+  const avert = checkScope(racine, { cfg: { scopeGate: "warning" }, staged: ["src/a.js"] });
+  assert.equal(avert.status, "ok");
+  assert.equal(avert.problems.length, 1);
+  assert.equal(checkScope(racine, { cfg: {}, staged: ["src/a.js"] }).status, "ok", "réglage absent : avertissement");
+});
+
+test("trailer : ajouté depuis l'état actif, rien en SCOPING", () => {
+  const racine = depot();
+  const message = join(racine, "MSG");
+  writeFileSync(message, "Un commit\n");
+  addTrailer(racine, message);
+  assert.doesNotMatch(readFileSync(message, "utf8"), /Drwil-Brief/);
+  ecrireEtat(racine, "BUILD");
+  addTrailer(racine, message);
+  addTrailer(racine, message);
+  const texte = readFileSync(message, "utf8");
+  assert.match(texte, /^Drwil-Brief: docs\/projects\/exemple\.md$/m);
+  assert.equal(texte.match(/Drwil-Brief/g).length, 1, "jamais en double");
+});
+
+test("QUA-246 : trailer : Drwil-Lot du lot courant ajouté quand la fiche active a des lots", () => {
+  const racine = depot();
+  ecrire(racine, FICHE, `${fiche(["src/a.js"])}\n## 6. Increments\n\n- **Lot 1 — a** [IA] : x.\n- **Lot 2 — b** [IA] : y.\n`);
+  ecrireEtat(racine, "BUILD");
+  ecrire(racine, ".drwil/lot.json", JSON.stringify({ brief: FICHE, current: 2, done: [1] }));
+  const message = join(racine, "MSG");
+  writeFileSync(message, "Un commit\n");
+  addTrailer(racine, message);
+  addTrailer(racine, message);
+  const texte = readFileSync(message, "utf8");
+  assert.match(texte, /^Drwil-Brief: docs\/projects\/exemple\.md\nDrwil-Lot: 2$/m);
+  assert.equal(texte.match(/Drwil-Lot/g).length, 1, "jamais en double");
+});
+
+test("trailer : jamais ajouté quand la gouvernance est désactivée (scopeGate: off)", () => {
+  const racine = depot();
+  ecrireEtat(racine, "BUILD");
+  ecrire(racine, ".drwil/ia-first.json", JSON.stringify({ scopeGate: "off" }));
+  const message = join(racine, "MSG");
+  writeFileSync(message, "Un commit\n");
+  addTrailer(racine, message);
+  assert.doesNotMatch(readFileSync(message, "utf8"), /Drwil-Brief/);
+});
+
+test("branche (CI, pre-push, verify) : chaque commit rejoué contre le cadrage de son parent", () => {
+  const racine = depot(["src/a.js"]);
+  git(racine, "checkout", "-q", "-b", "chantier");
+  ecrire(racine, "src/a.js", "a\n");
+  git(racine, "add", ".");
+  git(racine, "commit", "-q", "-m", "couvert\n\nDrwil-Brief: docs/projects/exemple.md");
+  ecrire(racine, "src/b.js", "b\n");
+  git(racine, "add", ".");
+  git(racine, "commit", "-q", "-m", "hors cadrage\n\nDrwil-Brief: docs/projects/exemple.md");
+  ecrire(racine, "README.md", "r\n");
+  git(racine, "add", ".");
+  git(racine, "commit", "-q", "-m", "sans trailer");
+  ecrire(racine, "docs/projects/autre.md", "# Projet : autre\n");
+  git(racine, "add", ".");
+  git(racine, "commit", "-q", "-m", "fiche seule, sans trailer");
+
+  const r = checkScope(racine, { cfg: { scopeGate: "blocking" }, env: { DRWIL_BASE: "main" } });
+  assert.equal(r.status, "fail");
+  const texte = r.problems.join("\n");
+  assert.equal(r.problems.length, 2, texte);
+  assert.match(texte, /src\/b\.js/);
+  assert.match(texte, /sans trailer Drwil-Brief/);
+  assert.doesNotMatch(texte, /src\/a\.js/);
+});
+
+test("branche : un commit dont le parent n'a pas encore la barrière n'est pas contrôlé", () => {
+  const racine = tmp("drwil-perimetre-");
+  git(racine, "init", "-q", "-b", "main");
+  git(racine, "config", "user.email", "test@example.invalid");
+  git(racine, "config", "user.name", "Test");
+  ecrire(racine, "README.md", "r\n");
+  git(racine, "add", ".");
+  git(racine, "commit", "-q", "-m", "base sans barrière");
+  git(racine, "checkout", "-q", "-b", "chantier");
+  ecrire(racine, "src/a.js", "a\n");
+  ecrire(racine, ".githooks/scope-gate.mjs", "// la barrière arrive avec ce commit\n");
+  git(racine, "add", ".");
+  git(racine, "commit", "-q", "-m", "introduit la barrière");
+  assert.deepEqual(checkScope(racine, { cfg: { scopeGate: "blocking" }, env: { DRWIL_BASE: "main" } }).problems, []);
+});
+
+test("branche sans référence : non exécuté, jamais un succès (QUA-013)", () => {
+  const racine = depot();
+  git(racine, "branch", "-m", "travail");
+  assert.equal(checkScope(racine, { cfg: { scopeGate: "blocking" }, env: {} }).status, "not-run");
+});
+
+test("branche : trailer vers une fiche sans bloc scope ou inexistante, chaque fichier est signalé", () => {
+  const racine = depot(["src/a.js"]);
+  ecrire(racine, "docs/projects/sans-scope.md", "# Projet : sans scope\n");
+  git(racine, "add", ".");
+  git(racine, "commit", "-q", "-m", "fiche sans scope");
+  git(racine, "checkout", "-q", "-b", "chantier");
+  ecrire(racine, "src/a.js", "a\n");
+  git(racine, "add", ".");
+  git(racine, "commit", "-q", "-m", "sans scope\n\nDrwil-Brief: docs/projects/sans-scope.md");
+  ecrire(racine, "src/b.js", "b\n");
+  git(racine, "add", ".");
+  git(racine, "commit", "-q", "-m", "fiche inexistante\n\nDrwil-Brief: docs/projects/fantome.md");
+  const r = checkScope(racine, { cfg: { scopeGate: "blocking" }, env: { DRWIL_BASE: "main" } });
+  assert.equal(r.status, "fail");
+  const texte = r.problems.join("\n");
+  assert.match(texte, /src\/a\.js outside the scope of docs\/projects\/sans-scope\.md|src\/a\.js.*sans-scope\.md/);
+  assert.match(texte, /src\/b\.js.*fantome\.md/);
+});
+
+test("hors dépôt git : non exécuté, avec un détail explicite, jamais un succès", () => {
+  const r = checkScope(tmp("drwil-perimetre-"), { cfg: { scopeGate: "blocking" }, env: {} });
+  assert.equal(r.status, "not-run");
+  assert.match(r.detail, /aucune branche de référence/);
+  assert.equal(r.configured, true);
+});
+
+test("référence DRWIL_BASE inconnue : repli sur master ou main, sinon non exécuté", () => {
+  const racine = depot();
+  assert.equal(checkScope(racine, { cfg: { scopeGate: "blocking" }, env: { DRWIL_BASE: "inconnue" } }).status, "ok");
+  git(racine, "branch", "-m", "travail");
+  assert.equal(checkScope(racine, { cfg: { scopeGate: "blocking" }, env: { DRWIL_BASE: "inconnue" } }).status, "not-run");
+});
+
+test("messages en anglais : activité, hors cadrage, commits sans trailer ou hors cadrage, échec", () => {
+  const cfg = { lang: "en" };
+  assert.match(
+    checkIndex({ files: ["src/a.js"], state: etat("SCOPING"), patterns: [], cfg })[0],
+    /^1 file\(s\) outside briefs committed in SCOPING/,
+  );
+  assert.match(
+    checkIndex({ files: ["src/b.js"], state: etat("BUILD"), patterns: ["src/a.js"], cfg })[0],
+    /^src\/b\.js: outside the scope of docs\/projects\/exemple\.md/,
+  );
+  const racine = depot(["src/a.js"]);
+  git(racine, "checkout", "-q", "-b", "chantier");
+  ecrire(racine, "src/a.js", "a\n");
+  git(racine, "add", ".");
+  git(racine, "commit", "-q", "-m", "fiche absente du parent\n\nDrwil-Brief: docs/projects/absente.md");
+  ecrire(racine, "README.md", "r\n");
+  git(racine, "add", ".");
+  git(racine, "commit", "-q", "-m", "sans trailer");
+  const r = checkScope(racine, { cfg: { ...cfg, scopeGate: "blocking" }, env: { DRWIL_BASE: "main" } });
+  assert.equal(r.message, "brief scope: 2 problem(s) (blocking gate)");
+  assert.match(r.problems[0], /: src\/a\.js outside the scope of docs\/projects\/absente\.md \(in the parent\)$/);
+  assert.match(r.problems[1], /: 1 file\(s\) outside briefs without a Drwil-Brief trailer$/);
+});
+
+test("liste hors périmètre réglable par la configuration", () => {
+  const racine = depot();
+  const r = checkScope(racine, { cfg: { scopeGate: "blocking", outOfScope: ["src/*"] }, staged: ["src/a.js"] });
+  assert.deepEqual(r, { status: "ok", problems: [] });
+});
+
+test("ligne de commande (prepare-commit-msg) : --trailer ajoute le trailer, sans fichier rien", () => {
+  const racine = depot();
+  ecrireEtat(racine, "BUILD");
+  const message = join(racine, "MSG");
+  writeFileSync(message, "Un commit\n");
+  const script = fileURLToPath(new URL("./scope-gate.mjs", import.meta.url));
+  assert.equal(spawnSync(process.execPath, [script, "--trailer"], { cwd: racine }).status, 0);
+  assert.equal(spawnSync(process.execPath, [script], { cwd: racine }).status, 0);
+  assert.doesNotMatch(readFileSync(message, "utf8"), /Drwil-Brief/);
+  assert.equal(spawnSync(process.execPath, [script, "--trailer", message], { cwd: racine }).status, 0);
+  assert.match(readFileSync(message, "utf8"), /^Drwil-Brief: docs\/projects\/exemple\.md$/m);
+});
+
+test("branche d'un clone : la référence est origin/HEAD", () => {
+  const racine = depot(["src/a.js"]);
+  git(racine, "update-ref", "refs/remotes/origin/principale", "HEAD");
+  git(racine, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/principale");
+  git(racine, "checkout", "-q", "-b", "chantier");
+  ecrire(racine, "src/b.js", "b\n");
+  git(racine, "add", ".");
+  git(racine, "commit", "-q", "-m", "hors cadrage\n\nDrwil-Brief: docs/projects/exemple.md");
+  const r = checkScope(racine, { cfg: { scopeGate: "blocking" }, env: {} });
+  assert.equal(r.problems.length, 1);
+  assert.match(r.problems[0], /src\/b\.js/);
+});
+
+test("QUA-050 : en détour, un fichier qui change les règles du jeu attend le oui de l'humain ; un détour ordinaire passe — en anglais aussi", () => {
+  const detour = { origin_brief: "docs/projects/chantier.md", origin_branch: "chantier/x", branch: "detour/d", stash: null };
+  const state = { ...etat("BUILD"), detour };
+  const patterns = [".githooks/x.mjs", "src/a.js", "docs/contracts.md"];
+  const files = [".githooks/x.mjs", "src/a.js", "docs/contracts.md"];
+  const fr = checkIndex({ files, state, patterns, cfg: {} });
+  assert.deepEqual(
+    fr.map((p) => p.split(" : ")[0]),
+    [".githooks/x.mjs", "docs/contracts.md"],
+  );
+  assert.match(
+    fr[0],
+    /demande le oui de l'humain — `node \.githooks\/detour\.mjs allow` dans un terminal ; en file, le sous-agent s'arrête/,
+  );
+  const en = checkIndex({ files, state, patterns, cfg: { lang: "en" } });
+  assert.match(en[0], /^\.githooks\/x\.mjs: a detour that changes the rules .* needs the human's yes/);
+  assert.deepEqual(checkIndex({ files, state: { ...state, detour: { ...detour, human: true } }, patterns, cfg: {} }), []);
+  assert.deepEqual(checkIndex({ files, state: etat("BUILD"), patterns, cfg: {} }), [], "hors détour, la règle ne s'applique pas");
+});
+
+test("QUA-050 : pendant un rebase, un commit rejoué garde son trailer ; hors dépôt git, rien ne casse", () => {
+  const racine = depot();
+  ecrireEtat(racine, "BUILD");
+  const message = join(racine, "message.txt");
+  for (const dossier of ["rebase-merge", "rebase-apply"]) {
+    writeFileSync(message, "Travail\n\nDrwil-Brief: docs/projects/autre.md\n");
+    mkdirSync(join(racine, ".git", dossier));
+    addTrailer(racine, message);
+    assert.equal(readFileSync(message, "utf8"), "Travail\n\nDrwil-Brief: docs/projects/autre.md\n", dossier);
+    rmdirSync(join(racine, ".git", dossier));
+  }
+  addTrailer(racine, message);
+  assert.match(readFileSync(message, "utf8"), new RegExp(`Drwil-Brief: ${FICHE}`), "hors rebase, le trailer suit l'état");
+  const horsGit = tmp("drwil-hors-git-");
+  ecrireEtat(horsGit, "BUILD");
+  writeFileSync(join(horsGit, "m.txt"), "Travail\n");
+  assert.doesNotThrow(() => addTrailer(horsGit, join(horsGit, "m.txt")));
+});
+
+const REGISTRE = "docs/contracts.md";
+const contrat = (id, regle) => `## ${id} — Titre de ${id}\n**Règle** : ${regle}\n**Contrôle** : \`tests-${id.toLowerCase()}\`\n`;
+const registre = (...contrats) => `# Contrats\n\nPréambule.\n\n${contrats.join("\n")}`;
+
+/** Dépôt en détour (sans le oui) dont HEAD porte un registre d'un contrat, cadré par la fiche. */
+function depotEnDetour(chemin = REGISTRE) {
+  const racine = depot([chemin, "src/a.js"]);
+  ecrire(racine, chemin, registre(contrat("QUA-001", "une règle.")));
+  git(racine, "add", ".");
+  git(racine, "commit", "-q", "-m", "registre");
+  const detour = { origin_brief: "docs/projects/chantier.md", origin_branch: "chantier/x", branch: "detour/d", stash: null };
+  ecrire(racine, ".drwil/state.json", JSON.stringify({ ...etat("BUILD"), detour }));
+  return racine;
+}
+
+/** Problèmes du commit qui indexerait `contenu` comme registre (`null` : supprimé). */
+function indexer(racine, contenu, chemin = REGISTRE, cfg = {}) {
+  if (contenu === null) git(racine, "rm", "-q", chemin);
+  else {
+    ecrire(racine, chemin, contenu);
+    git(racine, "add", chemin);
+  }
+  return checkScope(racine, { cfg: { scopeGate: "blocking", ...cfg }, staged: [chemin] }).problems;
+}
+
+test("QUA-050 : en détour, un ajout pur au registre passe sans le oui ; modifier ou retirer un contrat l'attend", () => {
+  const ajout = registre(contrat("QUA-001", "une règle."), contrat("QUA-002", "une nouvelle règle."));
+  assert.deepEqual(indexer(depotEnDetour(), ajout), [], "nouveau contrat ajouté à la fin");
+  const auMilieu = registre(contrat("QUA-003", "insérée avant."), contrat("QUA-001", "une règle."));
+  assert.deepEqual(indexer(depotEnDetour(), auMilieu), [], "nouveau contrat inséré avant un existant");
+  const refus = {
+    "règle existante modifiée": registre(contrat("QUA-001", "une règle changée."), contrat("QUA-002", "nouvelle.")),
+    "titre existant changé": registre(contrat("QUA-001", "une règle.").replace("Titre de", "Autre titre de")),
+    "contrat retiré": registre(contrat("QUA-002", "remplaçante.")),
+    "préambule modifié": registre(contrat("QUA-001", "une règle.")).replace("Préambule.", "Préambule changé."),
+    "section ajoutée qui n'est pas un contrat": registre(contrat("QUA-001", "une règle."), "## Annexe\nTexte.\n"),
+    "ID déjà défini sous un autre titre": registre(contrat("QUA-001", "une règle."), "## QUA-001 — Doublon\n**Règle** : x.\n"),
+    "titre répété, suivi d'un autre contrat": registre(
+      contrat("QUA-001", "une règle."),
+      contrat("QUA-001", "une règle."),
+      contrat("QUA-002", "n."),
+    ),
+    "registre retiré": null,
+  };
+  for (const [cas, contenu] of Object.entries(refus)) {
+    const problemes = indexer(depotEnDetour(), contenu);
+    assert.equal(problemes.length, 1, cas);
+    assert.match(problemes[0], /^docs\/contracts\.md : un détour qui change les règles du jeu/, cas);
+  }
+});
+
+test("QUA-050 : un registre absent de HEAD ou ailleurs (dirs.contracts) se juge de même ; dans le doute, le oui reste demandé", () => {
+  const racine = depot(["docs/autre.md"]);
+  const detour = { origin_brief: "docs/projects/chantier.md", origin_branch: "chantier/x", branch: "detour/d", stash: null };
+  ecrire(racine, ".drwil/state.json", JSON.stringify({ ...etat("BUILD"), detour }));
+  const cfg = { dirs: { contracts: "docs/autre.md" } };
+  assert.equal(indexer(racine, registre(contrat("QUA-001", "r.")), "docs/autre.md", cfg).length, 1, "registre créé : doute");
+  const ailleurs = depotEnDetour("docs/autre.md");
+  assert.deepEqual(indexer(ailleurs, registre(contrat("QUA-001", "une règle."), contrat("QUA-002", "n.")), "docs/autre.md", cfg), []);
+  // Fins de ligne Windows : un ajout reste un ajout.
+  const crlf = depotEnDetour();
+  assert.deepEqual(indexer(crlf, registre(contrat("QUA-001", "une règle."), contrat("QUA-002", "n.")).replace(/\n/g, "\r\n")), []);
+});
+
+test("QUA-050 : contractsAddedOnly, pur — ajout seul de contrats nouveaux, rien d'autre", () => {
+  const avant = registre(contrat("QUA-001", "r."));
+  assert.equal(contractsAddedOnly(avant, registre(contrat("QUA-001", "r."), contrat("QUA-002", "n."))), true);
+  assert.equal(contractsAddedOnly(avant, avant), true, "rien de changé");
+  assert.equal(contractsAddedOnly(null, avant), false);
+  assert.equal(contractsAddedOnly(avant, null), false);
+  assert.equal(contractsAddedOnly(`${avant}\n${contrat("QUA-001", "r.")}`, avant), false, "doublon dans l'ancien registre : doute");
+  assert.equal(
+    contractsAddedOnly("| QUA-009 | tableau |\n", "| QUA-009 | tableau |\n\n## QUA-009 — Doublon\n"),
+    false,
+    "ID déjà défini en tableau",
+  );
+});
+
+/** Branche `chantier` née de `main`, `main` avancée par `surMain`, puis fusion de `main` sans commit (MERGE_HEAD posé). */
+function fusion(racine, { surChantier = () => {}, surMain }) {
+  git(racine, "checkout", "-q", "-b", "chantier");
+  surChantier();
+  git(racine, "checkout", "-q", "main");
+  surMain();
+  git(racine, "checkout", "-q", "chantier");
+  spawnSync("git", ["merge", "--no-commit", "--no-ff", "-q", "main"], { cwd: racine, encoding: "utf8" });
+}
+const indexes = (racine) => git(racine, "diff", "--cached", "--name-only").split("\n").filter(Boolean);
+const commiter = (racine, message) => {
+  git(racine, "add", "-A");
+  git(racine, "commit", "-q", "-m", message);
+};
+
+test("QUA-111 : fusion de la branche principale en SCOPING : les fichiers apportés tels quels passent", () => {
+  // Constaté le 2026-10-23 (PR #213) : la fusion de master apportait un fichier déjà fusionné, refusé « hors fiches ».
+  const racine = depot();
+  fusion(racine, {
+    surMain: () => {
+      ecrire(racine, "outils/banc.test.mjs", "t\n");
+      ecrire(racine, "src/a.js", "a\n");
+      commiter(racine, "travail fusionné");
+    },
+  });
+  assert.deepEqual(indexes(racine).sort(), ["outils/banc.test.mjs", "src/a.js"]);
+  for (const activite of ["SCOPING", "CLOSING", "BUILD"]) {
+    ecrireEtat(racine, activite);
+    assert.deepEqual(
+      checkScope(racine, { cfg: { scopeGate: "blocking" }, staged: indexes(racine) }),
+      { status: "ok", problems: [] },
+      activite,
+    );
+  }
+});
+
+test("QUA-111 : fusion : un conflit résolu sur un fichier de code hors cadrage reste jugé, le reste apporté passe", () => {
+  const racine = depot(["src/a.js"]);
+  ecrire(racine, "src/c.js", "base\n");
+  commiter(racine, "c");
+  fusion(racine, {
+    surChantier: () => {
+      ecrire(racine, "src/c.js", "chantier\n");
+      commiter(racine, "côté chantier");
+    },
+    surMain: () => {
+      ecrire(racine, "src/c.js", "principale\n");
+      ecrire(racine, "outils/x.js", "x\n");
+      commiter(racine, "côté principale");
+    },
+  });
+  ecrire(racine, "src/c.js", "chantier\nprincipale\n");
+  git(racine, "add", "src/c.js");
+  const staged = indexes(racine);
+  assert.deepEqual(staged.sort(), ["outils/x.js", "src/c.js"]);
+  ecrireEtat(racine, "SCOPING");
+  const enCadrage = checkScope(racine, { cfg: { scopeGate: "blocking" }, staged });
+  assert.equal(enCadrage.status, "fail");
+  assert.match(enCadrage.problems[0], /^1 fichier\(s\) hors fiches commité\(s\) en SCOPING/);
+  ecrireEtat(racine, "BUILD");
+  const enBuild = checkScope(racine, { cfg: { scopeGate: "blocking" }, staged });
+  assert.equal(enBuild.problems.length, 1, enBuild.problems.join("\n"));
+  assert.match(enBuild.problems[0], /^src\/c\.js : hors du cadrage/);
+});
+
+test("QUA-111 : fusion : un fichier supprimé par la branche principale passe comme apporté", () => {
+  const racine = depot();
+  ecrire(racine, "src/d.js", "d\n");
+  commiter(racine, "d");
+  fusion(racine, {
+    surMain: () => {
+      git(racine, "rm", "-q", "src/d.js");
+      git(racine, "commit", "-q", "-m", "retire d");
+    },
+  });
+  assert.deepEqual(indexes(racine), ["src/d.js"]);
+  ecrireEtat(racine, "SCOPING");
+  assert.deepEqual(checkScope(racine, { cfg: { scopeGate: "blocking" }, staged: ["src/d.js"] }).problems, []);
+  // Un chemin que git refuse de lire (hors du dépôt) : la comparaison échoue, le fichier reste jugé (QUA-013).
+  const illisible = checkScope(racine, { cfg: { scopeGate: "blocking" }, staged: ["src/d.js", "../dehors.js"] });
+  assert.match(illisible.problems[0], /^1 fichier\(s\) hors fiches/);
+});
+
+test("QUA-111 : hors fusion, rien ne change ; un parent illisible juge le fichier, jamais ne le laisse passer (QUA-013)", () => {
+  const racine = depot();
+  ecrire(racine, "src/a.js", "a\n");
+  git(racine, "add", "src/a.js");
+  ecrireEtat(racine, "SCOPING");
+  const ordinaire = checkScope(racine, { cfg: { scopeGate: "blocking" }, staged: ["src/a.js"] });
+  assert.equal(ordinaire.status, "fail");
+  assert.match(ordinaire.problems[0], /SCOPING/);
+  // MERGE_HEAD vers un commit inexistant : la comparaison échoue, le fichier reste jugé.
+  writeFileSync(join(racine, ".git", "MERGE_HEAD"), `${"0".repeat(40)}\n`);
+  assert.equal(checkScope(racine, { cfg: { scopeGate: "blocking" }, staged: ["src/a.js"] }).status, "fail");
+});
+
+test("QUA-117 : chantier rouvert, un correctif qui change les règles du jeu attend le oui de l'humain ; un correctif ordinaire passe — en anglais aussi", () => {
+  const state = { ...etat("BUILD"), reopened: { pr: 42 } };
+  const patterns = [".githooks/x.mjs", "src/a.js", "docs/contracts.md", ".github/workflows/ci.yml", ".drwil/ia-first.json"];
+  const files = [".githooks/x.mjs", "src/a.js", "docs/contracts.md", ".github/workflows/ci.yml", ".drwil/ia-first.json"];
+  const fr = checkIndex({ files, state, patterns, cfg: {} });
+  assert.deepEqual(
+    fr.map((p) => p.split(" : ")[0]),
+    [".githooks/x.mjs", "docs/contracts.md", ".github/workflows/ci.yml", ".drwil/ia-first.json"],
+  );
+  assert.match(
+    fr[0],
+    /un correctif de réouverture qui change les règles du jeu \(contrat existant modifié ou retiré, hook, seuil, barrière, CI\) demande le oui de l'humain — `node \.githooks\/detour\.mjs allow`/,
+  );
+  // La source du gabarit d'une copie déclarée change les règles comme la copie.
+  const miroirs = { scopeMirrors: [{ from: "gabarit/", to: "" }] };
+  assert.equal(checkIndex({ files: ["gabarit/.githooks/y.mjs"], state, patterns: ["gabarit/**"], cfg: miroirs }).length, 1);
+  assert.deepEqual(checkIndex({ files: ["src/a.js"], state, patterns, cfg: {} }), [], "correctif ordinaire : personne");
+  const en = checkIndex({ files, state, patterns, cfg: { lang: "en" } });
+  assert.match(en[0], /^\.githooks\/x\.mjs: a reopening fix that changes the rules .* needs the human's yes/);
+  assert.deepEqual(checkIndex({ files, state: { ...state, reopened: { pr: 42, human: true } }, patterns, cfg: {} }), []);
+});
+
+test("QUA-117 : un test ajouté ou corrigé n'est pas une règle ; un test de contrat affaibli attend le oui, au détour comme à la réouverture — en anglais aussi", () => {
+  const patterns = [".githooks/x.test.mjs"];
+  const files = [".githooks/x.test.mjs"];
+  for (const exception of [{ reopened: { pr: 42 } }, { detour: { branch: "detour/x" } }]) {
+    const state = { ...etat("BUILD"), ...exception };
+    assert.deepEqual(checkIndex({ files, state, patterns, cfg: {}, weakened: () => [] }), []);
+    assert.deepEqual(checkIndex({ files, state, patterns, cfg: {} }), [], "sans lecture du diff : rien de reproché");
+    const fr = checkIndex({ files, state, patterns, cfg: {}, weakened: () => ["QUA-001 : a"] });
+    assert.equal(fr.length, 1);
+    assert.match(fr[0], /^\.githooks\/x\.test\.mjs : QUA-001 : a — test de contrat retiré ou affaibli .*detour\.mjs allow/);
+    assert.match(
+      checkIndex({ files, state, patterns, cfg: { lang: "en" }, weakened: () => ["QUA-001 : a"] })[0],
+      /contract test removed or weakened/,
+    );
+    assert.deepEqual(
+      checkIndex({
+        files,
+        state: { ...state, [Object.keys(exception)[0]]: { human: true } },
+        patterns,
+        cfg: {},
+        weakened: () => ["QUA-001 : a"],
+      }),
+      [],
+    );
+  }
+});
+
+test("QUA-117 : pre-commit réel : un test de contrat affaibli dans l'index est refusé et nommé, un test ajouté passe", () => {
+  const racine = depot([".githooks/t.test.mjs"]);
+  ecrire(racine, ".drwil/state.json", JSON.stringify({ ...etat("BUILD"), reopened: { pr: 42 } }));
+  const test = (extra) => `test("QUA-001 : a", () => {\n  assert.ok(1);\n  assert.ok(2);${extra}\n});\n`;
+  ecrire(racine, ".githooks/t.test.mjs", test(""));
+  git(racine, "add", ".githooks/t.test.mjs");
+  git(racine, "commit", "-q", "-m", "t");
+  ecrire(racine, ".githooks/t.test.mjs", `${test("")}test("QUA-002 : b", () => {\n  assert.ok(1);\n});\n`);
+  git(racine, "add", ".githooks/t.test.mjs");
+  assert.deepEqual(checkScope(racine, { cfg: { scopeGate: "blocking" }, staged: [".githooks/t.test.mjs"] }).problems, [], "ajout : libre");
+  ecrire(racine, ".githooks/t.test.mjs", 'test("QUA-001 : a", () => {\n  assert.ok(1);\n});\n');
+  git(racine, "add", ".githooks/t.test.mjs");
+  assert.match(
+    checkScope(racine, { cfg: { scopeGate: "blocking" }, staged: [".githooks/t.test.mjs"] }).problems.join("\n"),
+    /QUA-001 : a — test de contrat/,
+  );
+});
+
+test("QUA-117 : chantier rouvert, un ajout pur au registre passe sans le oui ; modifier un contrat l'attend ; le oui se donne dans un terminal", async () => {
+  const rouvert = () => {
+    const racine = depotEnDetour();
+    ecrire(racine, ".drwil/state.json", JSON.stringify({ ...etat("BUILD"), reopened: { pr: 42 } }));
+    return racine;
+  };
+  assert.deepEqual(indexer(rouvert(), registre(contrat("QUA-001", "une règle."), contrat("QUA-002", "nouvelle."))), []);
+  const refus = indexer(rouvert(), registre(contrat("QUA-001", "une règle changée.")));
+  assert.equal(refus.length, 1);
+  assert.match(refus[0], /^docs\/contracts\.md : un correctif de réouverture qui change les règles du jeu/);
+
+  const racine = rouvert();
+  assert.match((await allow(racine)).message, /terminal interactif/, "sans terminal, aucun oui");
+  const questions = [];
+  const non = await allow(racine, {
+    tty: true,
+    confirm: async (q) => {
+      questions.push(q);
+      return false;
+    },
+  });
+  assert.equal(non.code, 1);
+  assert.match(
+    questions[0],
+    /Le correctif de la réouverture de docs\/projects\/exemple\.md change les règles du jeu\. L'autoriser \? Retapez DETOUR/,
+  );
+  assert.deepEqual(readState(racine).state.reopened, { pr: 42 }, "refus : rien d'écrit");
+  const oui = await allow(racine, { tty: true, confirm: async () => true });
+  assert.equal(oui.code, 0);
+  assert.match(oui.message, /réouverture de docs\/projects\/exemple\.md autorisée à changer les règles du jeu/);
+  assert.deepEqual(readState(racine).state.reopened, { pr: 42, human: true });
+  assert.deepEqual(indexer(racine, registre(contrat("QUA-001", "une règle changée."))), [], "après le oui, le correctif passe");
+});
+
+test("QUA-172 : en SCOPING le registre des contrats s'écrit comme une fiche ; en BUILD il reste soumis au cadrage — en anglais aussi", () => {
+  const registre = "docs/contracts.md";
+  assert.deepEqual(checkIndex({ files: [FICHE, registre], state: etat("SCOPING"), patterns: [] }), []);
+  assert.match(checkIndex({ files: [registre, "src/a.js"], state: etat("SCOPING"), patterns: [] }).join("\n"), /1 fichier/);
+  assert.match(checkIndex({ files: [registre], state: etat("BUILD"), patterns: ["src/a.js"] })[0], /contracts\.md.*hors du cadrage/);
+  assert.match(checkIndex({ files: [registre], state: etat("CLOSING"), patterns: [] })[0], /CLOSING/);
+  assert.deepEqual(checkIndex({ files: [registre], state: etat("BUILD"), patterns: [registre] }), []);
+  // Source d'un gabarit déclaré (scopeMirrors) : la copie d'un registre n'est pas le registre.
+  const cfg = { lang: "en", dirs: { contracts: "docs/ctr.md" } };
+  assert.deepEqual(checkIndex({ files: ["docs/ctr.md"], state: etat("SCOPING"), patterns: [], cfg }), []);
+  assert.match(checkIndex({ files: ["docs/contracts.md"], state: etat("SCOPING"), patterns: [], cfg })[0], /only the BUILD activity/);
+});
+
+test("QUA-172 : branche : un commit sans trailer qui n'écrit que le registre passe, le reste du même commit reste signalé", () => {
+  const racine = depot(["src/a.js"]);
+  git(racine, "checkout", "-q", "-b", "chantier");
+  ecrire(racine, "docs/contracts.md", "## QUA-900 — Nouveau\n");
+  git(racine, "add", ".");
+  git(racine, "commit", "-q", "-m", "registre seul, en cadrage");
+  const cfg = { scopeGate: "blocking" };
+  const env = { DRWIL_BASE: "main" };
+  assert.equal(checkScope(racine, { cfg, env }).status, "ok");
+
+  ecrire(racine, "docs/contracts.md", "## QUA-900 — Nouveau\n\nplus\n");
+  ecrire(racine, "src/b.js", "b\n");
+  git(racine, "add", ".");
+  git(racine, "commit", "-q", "-m", "registre et code, sans trailer");
+  const r = checkScope(racine, { cfg, env });
+  assert.equal(r.status, "fail");
+  assert.match(r.problems.join("\n"), /1 fichier\(s\) hors fiches sans trailer/);
+
+  // Avec trailer (BUILD), le registre est jugé contre le cadrage du parent.
+  const autre = depot(["src/a.js"]);
+  git(autre, "checkout", "-q", "-b", "chantier");
+  ecrire(autre, "docs/contracts.md", "## QUA-900 — Nouveau\n");
+  git(autre, "add", ".");
+  git(autre, "commit", "-q", "-m", "registre en BUILD\n\nDrwil-Brief: docs/projects/exemple.md");
+  assert.match(checkScope(autre, { cfg, env }).problems.join("\n"), /docs\/contracts\.md hors du cadrage/);
+});
+
+test("QUA-213 : un commit qui change le bloc scope de la fiche active avertit avec les chemins, quel que soit le réglage — en anglais aussi", () => {
+  const racine = depot(["src/a.js"]);
+  ecrireEtat(racine, "BUILD");
+  ecrire(racine, FICHE, fiche(["src/a.js", "src/b.js"]));
+  git(racine, "add", FICHE);
+  for (const scopeGate of [undefined, "warning", "blocking", "off"]) {
+    const r = checkScope(racine, { cfg: { scopeGate }, staged: [FICHE] });
+    assert.notEqual(r.status, "fail", "l'avertissement n'échoue jamais seul");
+    assert.match(
+      r.problems.join("\n"),
+      /ATTENTION — le cadrage de docs\/projects\/exemple\.md change ; chemins ajoutés : src\/b\.js .*QUA-214/,
+      `scopeGate ${scopeGate}`,
+    );
+  }
+  const en = checkScope(racine, { cfg: { lang: "en" }, staged: [FICHE] });
+  assert.match(en.problems.join("\n"), /WARNING — the scope of .* changes; paths added: src\/b\.js/);
+  ecrire(racine, FICHE, fiche(["src/b.js"]));
+  git(racine, "add", FICHE);
+  assert.match(checkScope(racine, { cfg: {}, staged: [FICHE] }).problems.join("\n"), /ajoutés : src\/b\.js ; chemins retirés : src\/a\.js/);
+  assert.match(
+    checkScope(racine, { cfg: { lang: "en" }, staged: [FICHE] }).problems.join("\n"),
+    /paths added: src\/b\.js; paths removed: src\/a\.js/,
+  );
+  ecrire(racine, FICHE, fiche([]));
+  git(racine, "add", FICHE);
+  const retrait = checkScope(racine, { cfg: {}, staged: [FICHE] }).problems.join("\n");
+  assert.match(retrait, /change ; chemins retirés : src\/a\.js/);
+  assert.doesNotMatch(retrait, /ajoutés/);
+  assert.doesNotMatch(checkScope(racine, { cfg: { lang: "en" }, staged: [FICHE] }).problems.join("\n"), /paths added/);
+});
+
+test("QUA-213 : pas d'avertissement sans changement du bloc scope (texte de la fiche seul, autre fichier, fiche créée)", () => {
+  const racine = depot(["src/a.js"]);
+  ecrireEtat(racine, "BUILD");
+  ecrire(racine, FICHE, fiche(["src/a.js"]) + "\nUne remarque.\n");
+  ecrire(racine, "src/a.js", "x\n");
+  git(racine, "add", ".");
+  assert.deepEqual(checkScope(racine, { cfg: {}, staged: [FICHE, "src/a.js"] }).problems, []);
+  git(racine, "commit", "-q", "-m", "texte");
+  git(racine, "rm", "-q", "--cached", FICHE);
+  assert.deepEqual(
+    checkScope(racine, { cfg: {}, staged: [FICHE] }).problems.filter((p) => /ATTENTION/.test(p)),
+    [],
+  );
+});
+
+test("QUA-016 : en BUILD, une fiche ou une intention créée ou modifiée se commite sans changer l'état ni la fiche active ; au rejeu de la branche aussi", () => {
+  const racine = depot(["src/a.js"]);
+  git(racine, "checkout", "-q", "-b", "chantier");
+  ecrireEtat(racine, "BUILD");
+  const avant = readFileSync(join(racine, ".drwil/state.json"), "utf8");
+  const cadrage = ["docs/projects/nouvelle.md", "docs/intentions/idee.md", "docs/projects/autre.md"];
+  ecrire(racine, cadrage[0], fiche(["src/b.js"]));
+  ecrire(racine, cadrage[1], "# Intention : idée\n");
+  ecrire(racine, cadrage[2], "# Projet : autre\n");
+  git(racine, "add", ...cadrage);
+  const r = checkScope(racine, { cfg: { scopeGate: "blocking" }, staged: cadrage });
+  assert.equal(r.status, "ok");
+  assert.deepEqual(r.problems, [], "aucun refus, aucun avertissement d'élargissement : la fiche active n'est pas touchée");
+  git(racine, "commit", "-q", "-m", "cadrage en BUILD\n\nDrwil-Brief: docs/projects/exemple.md");
+  ecrire(racine, cadrage[1], "# Intention : idée\n\nPrécisée.\n");
+  git(racine, "add", cadrage[1]);
+  assert.deepEqual(checkScope(racine, { cfg: { scopeGate: "blocking" }, staged: [cadrage[1]] }).problems, [], "intention modifiée");
+  git(racine, "commit", "-q", "-m", "intention précisée\n\nDrwil-Brief: docs/projects/exemple.md");
+  assert.equal(readFileSync(join(racine, ".drwil/state.json"), "utf8"), avant, "état inchangé");
+  assert.equal(readState(racine).state.active_brief, FICHE, "fiche active inchangée");
+  const rejeu = checkScope(racine, { cfg: { scopeGate: "blocking" }, env: { DRWIL_BASE: "main" } });
+  assert.equal(rejeu.status, "ok", rejeu.problems.join("\n"));
+});
+
+test("QUA-016 : le cadrage commité en BUILD ne couvre pas le chantier : un code cadré par la nouvelle fiche reste refusé, au commit comme au rejeu", () => {
+  const racine = depot(["src/a.js"]);
+  git(racine, "checkout", "-q", "-b", "chantier");
+  ecrireEtat(racine, "BUILD");
+  ecrire(racine, "docs/projects/nouvelle.md", fiche(["src/b.js"]));
+  git(racine, "add", ".");
+  git(racine, "commit", "-q", "-m", "cadrage en BUILD\n\nDrwil-Brief: docs/projects/exemple.md");
+  ecrire(racine, "src/b.js", "b\n");
+  git(racine, "add", "src/b.js");
+  const r = checkScope(racine, { cfg: { scopeGate: "blocking" }, staged: ["src/b.js"] });
+  assert.equal(r.status, "fail");
+  assert.match(r.problems.join("\n"), /src\/b\.js : hors du cadrage de docs\/projects\/exemple\.md/);
+  git(racine, "commit", "-q", "-m", "code de la fiche cadrée\n\nDrwil-Brief: docs/projects/exemple.md");
+  const rejeu = checkScope(racine, { cfg: { scopeGate: "blocking" }, env: { DRWIL_BASE: "main" } });
+  assert.equal(rejeu.status, "fail");
+  assert.match(rejeu.problems.join("\n"), /src\/b\.js hors du cadrage de docs\/projects\/exemple\.md/);
+});
+
+test("QUA-016 : en BUILD, le registre des contrats reste refusé hors du périmètre, même commité avec une fiche de cadrage", () => {
+  const racine = depot(["src/a.js"]);
+  ecrireEtat(racine, "BUILD");
+  ecrire(racine, "docs/projects/nouvelle.md", fiche(["src/b.js"]));
+  ecrire(racine, "docs/contracts.md", "## QUA-900 — Nouveau\n");
+  git(racine, "add", ".");
+  const r = checkScope(racine, { cfg: { scopeGate: "blocking" }, staged: ["docs/projects/nouvelle.md", "docs/contracts.md"] });
+  assert.equal(r.status, "fail");
+  assert.equal(r.problems.length, 1, r.problems.join("\n"));
+  assert.match(r.problems[0], /docs\/contracts\.md : hors du cadrage/);
+});
+
+test("QUA-214 : la consigne du compte rendu de fin de tâche cite les chemins ajoutés au bloc scope, dépôt et gabarit ; l'avertissement la rappelle", () => {
+  const racine = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const gabarit = "packages/drwil/templates/common/base/";
+  const lire = (f) => readFileSync(join(racine, f), "utf8").replace(/\s+/g, " ");
+  assert.match(lire("AGENTS.md"), /Compte rendu de fin de tâche[^-]*chemins ajoutés au bloc `scope` de la fiche et raison \(QUA-214\)/);
+  assert.match(lire(`${gabarit}AGENTS.md`), /End-of-task report[^-]*paths added to the brief's `scope` block and why/);
+  for (const f of ["docs/ia-first/8-conduct-rules.md", `${gabarit}docs/ia-first/8-conduct-rules.md`])
+    assert.match(lire(f), /End-of-task report.*the paths added to the brief's `scope` block with the reason/);
+  for (const lang of ["fr", "en"]) assert.match(TEXTS[lang].widened("f.md", ["a"], []), /QUA-214/);
+});
+
+const sha = (texte) => createHash("sha256").update(texte).digest("hex");
+const MANIFESTE = ".drwil/installed-files.json";
+const ecrireManifeste = (racine, contenus) =>
+  ecrire(racine, MANIFESTE, JSON.stringify(Object.fromEntries(Object.entries(contenus).map(([f, c]) => [f, sha(c)])), null, 2) + "\n");
+
+/** Projet équipé : hooks et recette au manifeste, enregistrés dans le premier commit (branche main), puis branche de mise à jour. */
+function projetEquipe(config = { scopeGate: "blocking", layers: [], checks: [{ id: "a" }] }) {
+  const racine = depot();
+  const ancien = {
+    ".githooks/pre-push": "ancien hook\n",
+    ".githooks/obsolete.mjs": "obsolete\n",
+    "docs/recipes/x.md": "ancienne recette\n",
+  };
+  for (const [f, c] of Object.entries(ancien)) ecrire(racine, f, c);
+  ecrireManifeste(racine, ancien);
+  ecrire(racine, ".drwil/ia-first.json", JSON.stringify(config));
+  git(racine, "add", ".");
+  git(racine, "commit", "-q", "-m", "kit ancien");
+  git(racine, "checkout", "-q", "-b", "workstream/kit-update");
+  return racine;
+}
+
+/** Applique une mise à jour du kit : nouveau contenu des hooks, manifeste recalculé, obsolète retiré. */
+function appliquerMiseAJour(racine, { extra = {}, config } = {}) {
+  const nouveau = { ".githooks/pre-push": "nouveau hook\n", "docs/recipes/x.md": "nouvelle recette\n" };
+  for (const [f, c] of Object.entries(nouveau)) ecrire(racine, f, c);
+  rmSync(join(racine, ".githooks/obsolete.mjs"));
+  ecrireManifeste(racine, nouveau);
+  ecrire(racine, ".drwil/install.json", '{"format":1,"version":"2.0.0"}\n');
+  if (config) ecrire(racine, ".drwil/ia-first.json", JSON.stringify(config));
+  for (const [f, c] of Object.entries(extra)) ecrire(racine, f, c);
+  git(racine, "add", "-A");
+  return git(racine, "diff", "--cached", "--name-only").split("\n");
+}
+
+const MAJ = { DRWIL_KIT_UPDATE: "2.0.0" };
+const blocage = { cfg: { scopeGate: "blocking" } };
+const commiterMaj = (racine, trailer) =>
+  git(racine, "commit", "-q", "-m", "Mise à jour du kit", ...(trailer ? ["-m", `Drwil-Kit-Update: 2.0.0`] : []));
+
+test("QUA-238 : la mise à jour commitée par init passe la barrière au commit et au rejeu, en SCOPING bloquant", () => {
+  const racine = projetEquipe();
+  const fichiers = appliquerMiseAJour(racine);
+  assert.equal(
+    checkScope(racine, { ...blocage, staged: fichiers }).status,
+    "fail",
+    "sans le signal de init, 5 fichiers de mécanique sont refusés",
+  );
+  assert.deepEqual(checkScope(racine, { ...blocage, staged: fichiers, env: MAJ }).problems, []);
+  commiterMaj(racine, true);
+  assert.deepEqual(checkScope(racine, { ...blocage, env: { DRWIL_BASE: "main" } }).problems, []);
+  assert.equal(checkScope(racine, { ...blocage, env: { DRWIL_BASE: "main" } }).status, "ok");
+});
+
+test("QUA-238 : un fichier de mécanique modifié à la main reste refusé en SCOPING, avec ou sans trailer, avec ou sans le signal de init", () => {
+  const racine = projetEquipe();
+  ecrire(racine, ".githooks/pre-push", "édité à la main\n");
+  git(racine, "add", "-A");
+  const attendu = /fichier\(s\) hors fiches commité\(s\) en SCOPING.*npx drwil init/;
+  assert.match(checkScope(racine, { ...blocage, staged: [".githooks/pre-push"] }).problems.join("\n"), attendu);
+  const signal = checkScope(racine, { ...blocage, staged: [".githooks/pre-push"], env: MAJ });
+  assert.equal(signal.status, "fail", "la variable ne vaut pas sans l'empreinte du manifeste");
+  commiterMaj(racine, true);
+  const rejeu = checkScope(racine, { ...blocage, env: { DRWIL_BASE: "main" } });
+  assert.equal(rejeu.status, "fail");
+  assert.match(rejeu.problems.join("\n"), /1 fichier\(s\) hors fiches sans trailer Drwil-Brief/);
+});
+
+test("QUA-238 : dans le commit de mise à jour, un fichier hors manifeste, un retrait d'un fichier modifié ou une garde coupée restent jugés", () => {
+  const cas = [
+    { nom: "fichier hors manifeste", options: { extra: { "src/x.js": "x\n" } }, motif: /1 fichier\(s\)/ },
+    { nom: "garde coupée", options: { config: { scopeGate: "off", layers: [], checks: [{ id: "a" }] } }, motif: /1 fichier\(s\)/ },
+    { nom: "réglage de garde retiré", options: { config: { layers: [], checks: [{ id: "a" }] } }, motif: /1 fichier\(s\)/ },
+    { nom: "contrôle du projet retiré", options: { config: { scopeGate: "blocking", layers: [] } }, motif: /1 fichier\(s\)/ },
+    {
+      nom: "contrôle du projet remplacé",
+      options: { config: { scopeGate: "blocking", layers: [], checks: [{ id: "b" }] } },
+      motif: /1 fichier\(s\)/,
+    },
+    {
+      nom: "garde ajoutée coupée",
+      options: { config: { scopeGate: "blocking", layers: [], checks: [{ id: "a" }], transitions: "agent" } },
+      motif: /1 fichier\(s\)/,
+    },
+  ];
+  for (const { nom, options, motif } of cas) {
+    const racine = projetEquipe();
+    const fichiers = appliquerMiseAJour(racine, options);
+    const r = checkScope(racine, { ...blocage, staged: fichiers, env: MAJ });
+    assert.equal(r.status, "fail", nom);
+    assert.match(r.problems.join("\n"), motif, nom);
+    commiterMaj(racine, true);
+    assert.equal(checkScope(racine, { ...blocage, env: { DRWIL_BASE: "main" } }).status, "fail", `${nom} (rejeu)`);
+  }
+  // Un obsolète modifié à la main depuis l'installation n'est pas un retrait du kit.
+  const racine = projetEquipe();
+  ecrire(racine, ".githooks/obsolete.mjs", "modifié\n");
+  git(racine, "commit", "-q", "-am", "retouche", "--allow-empty");
+  const fichiers = appliquerMiseAJour(racine);
+  assert.equal(checkScope(racine, { ...blocage, staged: fichiers, env: MAJ }).status, "fail");
+});
+
+test("QUA-238 : la configuration recalculée par init, un contrôle et un réglage ajoutés passent ; la pile et les couches changent librement", () => {
+  const racine = projetEquipe();
+  const config = {
+    scopeGate: "blocking",
+    layers: ["app"],
+    stack: [{ path: "app" }],
+    checks: [{ id: "a" }, { id: "taille-kit" }],
+    release: { mode: "solo" },
+  };
+  const fichiers = appliquerMiseAJour(racine, { config });
+  assert.deepEqual(checkScope(racine, { ...blocage, staged: fichiers, env: MAJ }).problems, []);
+  commiterMaj(racine, true);
+  assert.equal(checkScope(racine, { ...blocage, env: { DRWIL_BASE: "main" } }).status, "ok");
+});
+
+test("QUA-238 : un manifeste ou une configuration illisibles dans le commit de mise à jour ne reconnaissent aucun fichier", () => {
+  for (const [nom, ecrireCorps] of [
+    ["manifeste non JSON", (racine) => ecrire(racine, MANIFESTE, "{")],
+    ["manifeste tableau", (racine) => ecrire(racine, MANIFESTE, "[]")],
+    ["configuration non JSON", (racine) => ecrire(racine, ".drwil/ia-first.json", "{")],
+    ["configuration tableau", (racine) => ecrire(racine, ".drwil/ia-first.json", "[]")],
+    [
+      "contrôles devenus un objet",
+      (racine) => ecrire(racine, ".drwil/ia-first.json", JSON.stringify({ scopeGate: "blocking", layers: [], checks: {} })),
+    ],
+  ]) {
+    const racine = projetEquipe();
+    const fichiers = appliquerMiseAJour(racine);
+    ecrireCorps(racine);
+    git(racine, "add", "-A");
+    const r = checkScope(racine, { ...blocage, staged: [...fichiers, ".drwil/ia-first.json"], env: MAJ });
+    assert.equal(r.status, "fail", nom);
+  }
+});
+
+test("QUA-238 : des contrôles absents avant la mise à jour ne se reconnaissent pas comme une liste complétée", () => {
+  const racine = projetEquipe({ scopeGate: "blocking", layers: [], checks: "aucun" });
+  const fichiers = appliquerMiseAJour(racine, { config: { scopeGate: "blocking", layers: [], checks: [{ id: "taille-kit" }] } });
+  assert.equal(checkScope(racine, { ...blocage, staged: fichiers, env: MAJ }).status, "fail");
+});
+
+test('QUA-238 : la mise à jour qui fait passer les `paths` d\'un contrôle du kit de `["**"]` aux chemins calculés passe ; tout autre changement de contrôle reste jugé', () => {
+  const avant = [
+    { id: "a", run: "x" },
+    { id: "coverage-root", run: "npx vitest run --coverage", paths: ["**"] },
+    { id: "coverage-diff-api", run: "diff-cover x", cwd: "api", paths: ["**"] },
+    { id: "e2e", run: "npx playwright test", paths: ["**"] },
+    { id: "lint", run: "npx biome check", paths: ["**"] },
+  ];
+  const equipe = () => {
+    const racine = projetEquipe({ scopeGate: "blocking", layers: [], checks: avant });
+    // Le code du projet est sur la branche principale, avant la branche de mise à jour.
+    git(racine, "checkout", "-q", "main");
+    for (const f of ["src/a.js", "api/b.js", "package.json", "README.md"]) ecrire(racine, f, "x\n");
+    git(racine, "add", "-A");
+    git(racine, "commit", "-q", "-m", "code du projet");
+    git(racine, "checkout", "-q", "-B", "workstream/kit-update");
+    return racine;
+  };
+  const calcules = ["*.json", "api/**", "src/**"];
+  const repathe = (changer) => {
+    const checks = avant.map((c) => ({ ...c }));
+    changer(checks);
+    return { scopeGate: "blocking", layers: [], checks };
+  };
+  const admis = repathe((c) => {
+    c[1].paths = calcules;
+    c[2].paths = ["api/**"];
+    c[3].paths = calcules;
+  });
+  const racine = equipe();
+  const fichiers = appliquerMiseAJour(racine, { config: admis });
+  assert.deepEqual(checkScope(racine, { ...blocage, staged: fichiers, env: MAJ }).problems, []);
+  commiterMaj(racine, true);
+  assert.equal(checkScope(racine, { ...blocage, env: { DRWIL_BASE: "main" } }).status, "ok", "au rejeu de la branche aussi");
+  const refus = [
+    ["chemins autres que ceux du kit", (c) => (c[1].paths = ["src/**"])],
+    ["chemins et commande changés", (c) => Object.assign(c[1], { paths: calcules, run: "npx vitest run" })],
+    ["contrôle du projet resserré", (c) => (c[4].paths = calcules)],
+    ["chemins du kit plus tout le dépôt", (c) => Object.assign(c[3], { paths: ["**", ...calcules] })],
+  ];
+  for (const [nom, changer] of refus) {
+    const r = equipe();
+    const f = appliquerMiseAJour(r, { config: repathe(changer) });
+    assert.equal(checkScope(r, { ...blocage, staged: f, env: MAJ }).status, "fail", nom);
+    commiterMaj(r, true);
+    assert.equal(checkScope(r, { ...blocage, env: { DRWIL_BASE: "main" } }).status, "fail", `${nom} (rejeu)`);
+  }
+});
+
+/** Commit d'installation dans un dépôt existant : parent sans manifeste, kit, manifeste et configuration créés. */
+function appliquerInstallation({ extra = {}, config = { scopeGate: "blocking", layers: [], checks: [{ id: "a" }] } } = {}) {
+  const racine = depot();
+  git(racine, "checkout", "-q", "-b", "workstream/kit-installation");
+  const kit = { ".githooks/pre-push": "hook\n", "docs/recipes/x.md": "recette\n" };
+  for (const [f, c] of Object.entries(kit)) ecrire(racine, f, c);
+  ecrireManifeste(racine, kit);
+  ecrire(racine, ".drwil/install.json", '{"format":1,"version":"2.0.0"}\n');
+  ecrire(racine, ".drwil/ia-first.json", JSON.stringify(config));
+  for (const [f, c] of Object.entries(extra)) ecrire(racine, f, c);
+  git(racine, "add", "-A");
+  return { racine, fichiers: git(racine, "diff", "--cached", "--name-only").split("\n") };
+}
+
+test("QUA-238 : le commit d'installation de init (parent sans manifeste, configuration créée) passe la barrière au commit et au rejeu", () => {
+  const { racine, fichiers } = appliquerInstallation();
+  assert.equal(checkScope(racine, { ...blocage, staged: fichiers }).status, "fail", "sans le signal de init, refusé en SCOPING");
+  assert.deepEqual(checkScope(racine, { ...blocage, staged: fichiers, env: MAJ }).problems, []);
+  commiterMaj(racine, true);
+  assert.equal(checkScope(racine, { ...blocage, env: { DRWIL_BASE: "main" } }).status, "ok");
+});
+
+test("QUA-238 : dans le commit d'installation, un fichier hors manifeste ou une garde coupée dans la configuration créée restent refusés", () => {
+  for (const [nom, options] of [
+    ["fichier hors manifeste", { extra: { "src/x.js": "x\n" } }],
+    ["barrière coupée", { config: { scopeGate: "off", layers: [] } }],
+    ["transitions laissées à l'agent", { config: { scopeGate: "blocking", transitions: "agent" } }],
+  ]) {
+    const { racine, fichiers } = appliquerInstallation(options);
+    const r = checkScope(racine, { ...blocage, staged: fichiers, env: MAJ });
+    assert.equal(r.status, "fail", nom);
+    assert.match(r.problems.join("\n"), /1 fichier\(s\)/, nom);
+    commiterMaj(racine, true);
+    assert.equal(checkScope(racine, { ...blocage, env: { DRWIL_BASE: "main" } }).status, "fail", `${nom} (rejeu)`);
+  }
+  // Seul un parent sans manifeste vaut installation : une configuration créée par une mise à jour reste refusée.
+  const racine = projetEquipe();
+  git(racine, "rm", "-q", ".drwil/ia-first.json");
+  git(racine, "commit", "-q", "-m", "configuration retirée");
+  const fichiers = appliquerMiseAJour(racine, { config: { scopeGate: "blocking", layers: [] } });
+  assert.equal(checkScope(racine, { ...blocage, staged: fichiers, env: MAJ }).status, "fail", "configuration créée par une mise à jour");
+});
+
+// Fichiers dérivés du périmètre (scope-derived.mjs) : admis d'office, jamais un fichier de règles.
+/** Dépôt cadré sur `src/a.js`, registre et fiche à critères commités sur main, puis une branche de chantier en BUILD. */
+function depotDerive({ registre = "", criteres = "", motifs = ["src/a.js"] } = {}) {
+  const racine = depot(motifs);
+  ecrire(racine, FICHE, `${fiche(motifs)}${criteres}`);
+  if (registre) ecrire(racine, "docs/contracts.md", registre);
+  ecrire(racine, "src/a.js", "export const a = 1;\n");
+  ecrire(racine, "src/a-ancien.js", "export const v = 1;\n");
+  git(racine, "add", ".");
+  git(racine, "commit", "-q", "-m", "cadrage");
+  git(racine, "checkout", "-q", "-b", "chantier");
+  ecrireEtat(racine, "BUILD");
+  return racine;
+}
+const indexerDerive = (racine, fichiers) => {
+  for (const [chemin, contenu] of Object.entries(fichiers)) ecrire(racine, chemin, contenu);
+  git(racine, "add", ...Object.keys(fichiers));
+  return Object.keys(fichiers);
+};
+
+test("QUA-311 : pre-commit : un test qui cite un module cadré est admis d'office ; un test qui ne le cite pas reste refusé (QUA-016)", () => {
+  const racine = depotDerive();
+  const fichiers = indexerDerive(racine, {
+    "src/a.test.js": 'import { a } from "./a.js";\n',
+    "test/a-sans-extension.test.js": 'const { a } = require("../src/a");\n',
+    "test/b.test.js": 'import { b } from "../src/b.js";\n',
+    "src/c.test.js": "// cite src/ab.js et src/a.json seulement\n",
+  });
+  const r = checkScope(racine, { cfg: { scopeGate: "blocking" }, staged: fichiers });
+  assert.equal(r.status, "fail");
+  const texte = r.problems.join("\n");
+  assert.match(texte, /ADMIS D'OFFICE — src\/a\.test\.js : test qui cite src\/a\.js \(cas 1\)/);
+  assert.match(texte, /ADMIS D'OFFICE — test\/a-sans-extension\.test\.js : test qui cite src\/a\.js/);
+  assert.match(texte, /test\/b\.test\.js : hors du cadrage/);
+  assert.match(texte, /src\/c\.test\.js : hors du cadrage/);
+  assert.doesNotMatch(texte, /src\/a\.test\.js : hors du cadrage/);
+  assert.equal(r.problems.filter((p) => /hors du cadrage/.test(p)).length, 2, texte);
+});
+
+test("QUA-311 : la découpe d'un fichier cadré (neuf, même dossier, nom préfixé, importée) est admise ; sinon refusée", () => {
+  const racine = depotDerive();
+  const fichiers = indexerDerive(racine, {
+    "src/a.js": 'import "./a-partie.js";\nimport "./a-ancien.js";\nimport "../lib/a-ailleurs.js";\nimport "./ab-voisin.js";\n',
+    "src/a-partie.js": "export const p = 1;\n",
+    "src/a-autre.js": "export const o = 1;\n",
+    "src/a-ancien.js": "export const v = 2;\n",
+    "lib/a-ailleurs.js": "export const l = 1;\n",
+    "src/ab-voisin.js": "export const n = 1;\n",
+  });
+  const texte = checkScope(racine, { cfg: { scopeGate: "blocking" }, staged: fichiers }).problems.join("\n");
+  assert.match(texte, /ADMIS D'OFFICE — src\/a-partie\.js : découpe de src\/a\.js \(cas 3\)/);
+  for (const refuse of ["src/a-autre.js", "src/a-ancien.js", "lib/a-ailleurs.js", "src/ab-voisin.js"])
+    assert.match(texte, new RegExp(`${refuse.replace(/[./]/g, "\\$&")} : hors du cadrage`), refuse);
+  // Sans branche principale lisible, rien n'est neuf : la découpe n'est pas admise (QUA-013).
+  git(racine, "branch", "-q", "-D", "main");
+  assert.match(
+    checkScope(racine, { cfg: { scopeGate: "blocking" }, staged: fichiers }).problems.join("\n"),
+    /src\/a-partie\.js : hors du cadrage/,
+  );
+});
+
+test("QUA-311 : un fichier cité au Périmètre ou aux Tests d'un contrat que la fiche cite est admis ; le registre se lit dans HEAD", () => {
+  const registre =
+    "## QUA-900 — x\n**Règle** : r.\n**Périmètre** : `lib/x.js` (`fonction`), `ci/github`\n**Tests** : `test/x.test.js`\n\n" +
+    "## QUA-901 — y\n**Règle** : r.\n**Périmètre** : `lib/y.js`\n\n## QUA-902 — z\n**Règle** : r.\n**Périmètre** : `lib/z.js`\n";
+  const criteres = "\n## Critères d'acceptation\n\n- un critère — `QUA-900`\n\n## Contrats modifiés\n\n- `QUA-901` — raison (validé)\n";
+  const racine = depotDerive({ registre, criteres });
+  const fichiers = indexerDerive(racine, { "lib/x.js": "x\n", "test/x.test.js": "t\n", "lib/y.js": "y\n", "lib/z.js": "z\n" });
+  const texte = checkScope(racine, { cfg: { scopeGate: "blocking" }, staged: fichiers }).problems.join("\n");
+  assert.match(texte, /ADMIS D'OFFICE — lib\/x\.js : cité par le contrat QUA-900 \(cas 2\)/);
+  assert.match(texte, /ADMIS D'OFFICE — test\/x\.test\.js : cité par le contrat QUA-900/);
+  assert.match(texte, /ADMIS D'OFFICE — lib\/y\.js : cité par le contrat QUA-901/);
+  assert.match(texte, /lib\/z\.js : hors du cadrage/);
+  // Ajouter un chemin au Périmètre dans le même commit n'admet rien : le registre est lu dans HEAD.
+  ecrire(racine, "docs/contracts.md", registre.replace("`lib/x.js`", "`lib/x.js`, `lib/z.js`"));
+  git(racine, "add", "docs/contracts.md");
+  const meme = checkScope(racine, { cfg: { scopeGate: "blocking" }, staged: ["lib/z.js"] }).problems.join("\n");
+  assert.match(meme, /lib\/z\.js : hors du cadrage/);
+});
+
+test("QUA-311 : la source de gabarit d'une copie citée est admise (scopeMirrors à rebours), pas celle d'une copie non citée", () => {
+  const racine = depotDerive();
+  const cfg = { scopeGate: "blocking", scopeMirrors: [{ from: "tpl/", to: "" }] };
+  const fichiers = indexerDerive(racine, { "tpl/src/a.js": "a\n", "tpl/src/b.js": "b\n" });
+  const texte = checkScope(racine, { cfg, staged: fichiers }).problems.join("\n");
+  assert.match(texte, /ADMIS D'OFFICE — tpl\/src\/a\.js : source de gabarit de la copie src\/a\.js \(cas 4\)/);
+  assert.match(texte, /tpl\/src\/b\.js : hors du cadrage/);
+});
+
+test("QUA-311 : au rejeu de la branche, la dérivation se juge sur le commit, jamais la copie de travail ; fiche absente : rien n'est admis", () => {
+  const racine = depotDerive();
+  indexerDerive(racine, { "src/a.test.js": 'import "./a.js";\n' });
+  git(racine, "commit", "-q", "-m", "test\n\nDrwil-Brief: docs/projects/exemple.md");
+  indexerDerive(racine, { "src/d.test.js": "// ne cite rien\n" });
+  git(racine, "commit", "-q", "-m", "autre test\n\nDrwil-Brief: docs/projects/exemple.md");
+  // La copie de travail cite le module : sans effet sur le commit déjà jugé.
+  ecrire(racine, "src/d.test.js", 'import "./a.js";\n');
+  indexerDerive(racine, { "src/e.test.js": 'import "./a.js";\n' });
+  git(racine, "commit", "-q", "-m", "fiche absente\n\nDrwil-Brief: docs/projects/absente.md");
+  const r = checkScope(racine, { cfg: { scopeGate: "blocking" }, env: { DRWIL_BASE: "main" } });
+  assert.equal(r.status, "fail");
+  const texte = r.problems.join("\n");
+  assert.doesNotMatch(texte, /src\/a\.test\.js/);
+  assert.match(texte, /src\/d\.test\.js hors du cadrage de docs\/projects\/exemple\.md/);
+  assert.match(texte, /src\/e\.test\.js hors du cadrage de docs\/projects\/absente\.md/);
+  assert.equal(r.problems.length, 2, texte);
+});
+
+test("QUA-312 : un fichier de règles n'est jamais admis d'office, et son refus le dit — au commit comme au rejeu, en anglais aussi", () => {
+  const registre =
+    "## QUA-900 — x\n**Règle** : r.\n**Périmètre** : `AGENTS.md`, `src/CLAUDE.md`, `.claude/settings.json`, `docs/contracts.md`\n";
+  const racine = depotDerive({
+    registre,
+    criteres: "\n## Critères d'acceptation\n\n- un critère — `QUA-900`\n",
+    motifs: ["src/a.js", ".githooks/g.mjs"],
+  });
+  ecrire(racine, ".githooks/g.mjs", 'import "./g-partie.mjs";\n');
+  const fichiers = indexerDerive(racine, {
+    ".githooks/g.mjs": 'import "./g-partie.mjs";\n',
+    ".githooks/g-partie.mjs": "export {};\n",
+    ".githooks/g.test.mjs": 'import "./g.mjs";\n',
+    "AGENTS.md": "a\n",
+    "src/CLAUDE.md": "c\n",
+    ".claude/settings.json": "{}\n",
+  });
+  const r = checkScope(racine, { cfg: { scopeGate: "blocking" }, staged: fichiers });
+  const texte = r.problems.join("\n");
+  assert.match(
+    texte,
+    /ADMIS D'OFFICE — \.githooks\/g\.test\.mjs : test qui cite \.githooks\/g\.mjs/,
+    "un test de hook n'est pas une règle",
+  );
+  for (const regle of [".githooks/g-partie.mjs", "AGENTS.md", "src/CLAUDE.md", ".claude/settings.json"]) {
+    assert.match(
+      texte,
+      new RegExp(`(^|\\n)${regle.replace(/[./]/g, "\\$&")} : hors du cadrage .* — fichier de règles, jamais admis d'office`),
+      regle,
+    );
+    assert.doesNotMatch(texte, new RegExp(`ADMIS D'OFFICE — ${regle.replace(/[./]/g, "\\$&")} `), regle);
+  }
+  assert.match(
+    checkScope(racine, { cfg: { scopeGate: "blocking", lang: "en" }, staged: fichiers }).problems.join("\n"),
+    /AGENTS\.md: outside the scope .* a rules file, never admitted as derived/,
+  );
+  git(racine, "commit", "-q", "-m", "règles\n\nDrwil-Brief: docs/projects/exemple.md");
+  const rejeu = checkScope(racine, { cfg: { scopeGate: "blocking" }, env: { DRWIL_BASE: "main" } }).problems.join("\n");
+  assert.match(rejeu, /\.githooks\/g-partie\.mjs hors du cadrage de docs\/projects\/exemple\.md \(dans le parent\) — fichier de règles/);
+  assert.doesNotMatch(rejeu, /g\.test\.mjs/);
+});
+
+test("QUA-313 : chaque admission est dite au commit qui l'utilise, quel que soit le réglage, jamais un échec à elle seule — en anglais aussi", () => {
+  const racine = depotDerive();
+  const fichiers = indexerDerive(racine, { "src/a.test.js": 'import "./a.js";\n' });
+  for (const scopeGate of [undefined, "warning", "blocking", "off"]) {
+    const r = checkScope(racine, { cfg: { scopeGate }, staged: fichiers });
+    assert.notEqual(r.status, "fail", `scopeGate ${scopeGate}`);
+    assert.deepEqual(r.problems, [
+      "ADMIS D'OFFICE — src/a.test.js : test qui cite src/a.js (cas 1), dérivé du cadrage de docs/projects/exemple.md sans l'élargir — à citer dans le compte rendu",
+    ]);
+  }
+  assert.match(
+    checkScope(racine, { cfg: { lang: "en" }, staged: fichiers }).problems.join("\n"),
+    /^ADMITTED AS DERIVED — src\/a\.test\.js: test citing src\/a\.js \(case 1\), derived from the scope of docs\/projects\/exemple\.md/,
+  );
+  // Hors BUILD, rien n'est admis ni dit : l'activité refuse.
+  ecrireEtat(racine, "SCOPING");
+  const scoping = checkScope(racine, { cfg: { scopeGate: "blocking" }, staged: fichiers });
+  assert.equal(scoping.status, "fail");
+  assert.doesNotMatch(scoping.problems.join("\n"), /ADMIS/);
+});
+
+test("QUA-311 : derivation, pure : chemin depuis la racine, test illisible, critère sans preuve, contrat sans Périmètre ; copie de travail et texte à écrire", () => {
+  const brief = `${fiche(["src/a.js"])}\n## Critères d'acceptation\n\n- sans preuve\n- avec — \`QUA-900\`\n`;
+  const registry = "## QUA-900 — x\n**Règle** : r.\n**Tests** : `test/x.test.js`, `test/*.js`\n";
+  const ctx = (textes) => ({ patterns: ["src/a.js"], brief, registry, read: (p) => textes[p] ?? null, isNew: () => false, cfg: {} });
+  assert.deepEqual(derivation("e2e/a.test.js", ctx({ "e2e/a.test.js": "// voir src/a.js\n" })), { kind: 1, from: "src/a.js" });
+  assert.equal(derivation("e2e/b.test.js", ctx({})), null, "test illisible ou supprimé : rien");
+  assert.deepEqual(derivation("test/x.test.js", ctx({})), { kind: 2, from: "QUA-900" }, "contrat sans Périmètre, Tests lus");
+  assert.equal(derivation("test/y.js", ctx({})), null, "un joker du registre n'admet rien");
+  assert.equal(derivation("src/a.js", ctx({})), null, "déjà cité : rien à dériver");
+  assert.deepEqual(
+    derivation("src/b.test.js", { ...ctx({ "src/b.test.js": 'import "./a.js";' }), brief: null }),
+    { kind: 1, from: "src/a.js" },
+    "sans fiche lue, aucun contrat",
+  );
+  assert.equal(derivation("test/x.test.js", { ...ctx({}), brief: null }), null);
+  const racine = depot(["src/a.js"]);
+  ecrire(racine, "src/a.test.js", "// rien\n");
+  const fiches = [
+    ["docs/projects/illisible.md", null],
+    [FICHE, fiche(["src/a.js"])],
+  ];
+  assert.equal(derivedInWorktree(racine, ["src/a.test.js"], fiches, {}).size, 0, "fichier écrit qui ne cite rien");
+  const ecrit = derivedInWorktree(racine, ["src/a.test.js", "src/neuf.test.js"], fiches, {}, { extra: () => 'import "./a.js";' });
+  assert.deepEqual([...ecrit.keys()], ["src/a.test.js", "src/neuf.test.js"], "texte à écrire, fichier présent ou non");
+  assert.equal(ecrit.get("src/neuf.test.js").brief, FICHE, "fiche illisible ignorée");
+  assert.match(
+    TEXTS.en.outsideScopeCommit("abc1234", "src/b.js", FICHE, false),
+    /^abc1234: src\/b\.js outside the scope of .* \(in the parent\)$/,
+  );
+  assert.match(
+    TEXTS.en.outsideScopeCommit("abc1234", "AGENTS.md", FICHE, true),
+    /\(in the parent\) — a rules file, never admitted as derived$/,
+  );
+  // Registre ailleurs (dirs.contracts) : lu à cet endroit.
+  ecrire(racine, "regles.md", "## QUA-900 — x\n**Périmètre** : `lib/p.js`\n");
+  const declares = [[FICHE, `${fiche(["src/a.js"])}\n## Contrats modifiés\n\n- \`QUA-900\` — raison\n`]];
+  assert.equal(derivedInWorktree(racine, ["lib/p.js"], declares, { dirs: { contracts: "regles.md" } }).get("lib/p.js").kind, 2);
+  assert.equal(derivedInWorktree(racine, ["lib/p.js"], declares, {}).size, 0);
+});
+
+test("QUA-238 : kitPaths donne ses chemins à un contrôle du kit : couche, dossiers de code, extensions, fichiers sans extension ; jamais ceux du kit ni la documentation", () => {
+  assert.deepEqual(kitPaths("app", ["app/a.ts"]), ["app/**"]);
+  assert.deepEqual(kitPaths("", ["src/a.ts", "x.js"]).sort(), ["*.js", "src/**"]);
+  const fichiers = [
+    "src/a.ts",
+    "src/b.ts",
+    "docs/guide.md",
+    ".githooks/pre-commit",
+    "node_modules/x/y.js",
+    "README.md",
+    ".gitignore",
+    "vite.config.js",
+    "main.js",
+    "Makefile",
+    ".env",
+  ];
+  assert.deepEqual(kitPaths(".", fichiers), ["*.js", ".env", "Makefile", "src/**"]);
+  assert.deepEqual(kitPaths(".", ["docs/a.md", "README.md", ".gitignore"]), ["**"], "rien que le kit ou la doc : tout");
+  assert.deepEqual(kitPaths(".", []), ["**"]);
+});
+
+test("QUA-238 : nonKitFiles juge la configuration d'une mise à jour même quand git ne peut pas lister l'arbre (liste vide)", () => {
+  const avant = { scopeGate: "blocking", checks: [{ id: "coverage-app", cwd: "app", paths: ["**"] }] };
+  const racine = projetEquipe(avant);
+  ecrire(racine, ".drwil/ia-first.json", JSON.stringify({ ...avant, checks: [{ id: "coverage-app", cwd: "app", paths: ["app/**"] }] }));
+  git(racine, "add", "-A");
+  git(racine, "commit", "-q", "-m", "chemins recalculés");
+  const complet = nonKitFiles(racine, "HEAD~1", "HEAD", [".drwil/ia-first.json"]);
+  assert.deepEqual(complet, [], "arbre listable : chemins de la couche");
+  // Un sous-arbre manquant fait échouer `ls-tree -r` : la liste des fichiers est alors vide, jugée sans planter.
+  const arbre = git(racine, "rev-parse", "HEAD:docs");
+  rmSync(join(racine, ".git/objects", arbre.slice(0, 2), arbre.slice(2)), { force: true });
+  assert.deepEqual(nonKitFiles(racine, "HEAD~1", "HEAD", [".drwil/ia-first.json"]), []);
+});

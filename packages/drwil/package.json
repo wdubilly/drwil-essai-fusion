@@ -1,0 +1,40 @@
+{
+  "name": "drwil",
+  "license": "MIT",
+  "version": "0.11.2",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "drwil": "./bin/drwil.js"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "serve",
+    "templates",
+    "CHANGELOG.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc --build",
+    "typecheck": "tsc --noEmit",
+    "test": "tsc --build && node --test",
+    "test:coverage": "tsc --build && c8 --check-coverage --lines 98 --branches 90 --functions 98 --all --include=dist/**/*.js --include=bin/*.js --reporter=text node --test",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "commander": "^12.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "c8": "^12.0.0",
+    "typescript": "^5.6.3"
+  }
+}

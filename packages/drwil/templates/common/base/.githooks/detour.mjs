@@ -1,0 +1,165 @@
+#!/usr/bin/env node
+// Detour (QUA-050): mid-workstream, a prior defect outside the active brief's scope is fixed on its own
+// branch, cut from the main branch, under its own short brief — the workstream's scope never widens
+// for it (QUA-019, no bypassing a check; QUA-017, no direct work on the main branch).
+// - `open <name> --title <defect> [--files <a,b>]` (BUILD): sets the work in progress aside (named
+//   stash, recorded in the state), creates the branch detour/<name> and its brief, points the state at it.
+// - `resume` (detour-resume.mjs, re-exported): back to the workstream's branch brought up to the fixed main
+//   branch without ever rewriting a pushed branch, the work restored, the state pointed back at the
+//   workstream's brief; refused without losing anything if any step fails.
+// - `allow` (human, interactive terminal, or the `drwil-detour` chat poll read by the hook): the yes a detour, or a
+//   reopened workstream's fix (QUA-117), that changes the rules needs; until then the scope gate refuses its commits
+//   touching them (`rulesFiles`).
+// It never commits, pushes nor opens the PR; the state is written by `setDetour` (state.mjs) only.
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { BRIEF_DIRS, config } from "./briefs.mjs";
+import { mainBranch } from "./close.mjs";
+import { baseRef, git, resume } from "./detour-resume.mjs";
+import { contractsAddedOnly, isHookTest, isRegistry, RULES, rulesFiles, weakenedTests } from "./detour-rules.mjs";
+import { TEXTS } from "./detour-texts.mjs";
+import { minimumLevel, SENSITIVE_PATHS } from "./risk.mjs";
+import { normalize } from "./scope.mjs";
+import { readState, setDetour, stateRoot, writeState } from "./state.mjs";
+import { fill } from "./state-texts.mjs";
+
+export { contractsAddedOnly, isHookTest, isRegistry, resume, RULES, rulesFiles, weakenedTests };
+
+const texts = (root) => TEXTS[config(root).lang === "en" ? "en" : "fr"];
+const done = (message) => ({ code: 0, message });
+const refused = (message) => ({ code: 1, message });
+
+/** Opens a detour (see the header). `{ code, message }`. */
+export function open(root, name, { title, files = [], now = new Date().toISOString() } = {}) {
+  const T = texts(root);
+  const cfg = config(root);
+  const { state } = readState(root);
+  if (state.activity !== "BUILD") return refused(fill(T.notBuild, state.activity));
+  if (state.detour) return refused(fill(T.already, state.detour.branch));
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(name ?? "") || !title) return refused(T.name);
+  const main = mainBranch(root);
+  const current = git(root, "symbolic-ref", "--quiet", "--short", "HEAD");
+  if (!main || !current || current === main) return refused(T.noBranch);
+  const branch = `detour/${name}`;
+  const brief = `${BRIEF_DIRS[0]}detour-${name}.md`;
+  if (git(root, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`) !== null || existsSync(join(root, brief)))
+    return refused(fill(T.exists, branch, brief));
+  const base = baseRef(root, main);
+  // The branch first: a failed `git switch -c` leaves the worktree half switched; `git branch` touches nothing.
+  const r = spawnSync("git", ["branch", branch, base], { cwd: root, encoding: "utf8" });
+  if (r.status !== 0) return refused(fill(T.switchFailed, r.stderr.trim()));
+  let stash = null;
+  if (git(root, "status", "--porcelain") !== "") {
+    if (git(root, "stash", "push", "-q", "--include-untracked", "-m", `drwil-detour: ${name}`) === null) {
+      git(root, "branch", "-D", branch);
+      return refused(T.stashFailed);
+    }
+    stash = git(root, "rev-parse", "stash@{0}");
+  }
+  // Clean worktree (everything set aside), new branch from an existing commit: nothing left to block it.
+  git(root, "switch", "-q", branch);
+  const list = files.map(normalize);
+  const risk = minimumLevel(list, cfg.risk?.sensitivePaths ?? SENSITIVE_PATHS) === "HIGH" ? "HIGH" : "MEDIUM";
+  mkdirSync(dirname(join(root, brief)), { recursive: true });
+  const origin = state.active_brief;
+  const scopeLines = list.map((f) => `  - ${f}`).join("\n");
+  writeFileSync(join(root, brief), fill(T.brief, title, origin, branch, now.slice(0, 10), risk, scopeLines));
+  setDetour(root, brief, { origin_brief: origin, origin_branch: current, branch, stash }, now);
+  const rules = rulesFiles(list, cfg);
+  const report = [
+    fill(T.opened, branch, base, brief, stash ? fill(T.stashed, stash.slice(0, 7)) : ""),
+    fill(T.steps, origin, branch, brief),
+  ];
+  if (rules.length) report.push(fill(T.rulesAhead, rules.join(", ")));
+  return done(report.join("\n"));
+}
+
+/** What awaits the human's yes: the detour's branch, or the reopened workstream's brief; null without either. */
+function awaited(state) {
+  if (state.detour) return { reopened: false, name: state.detour.branch };
+  return state.reopened ? { reopened: true, name: state.active_brief } : null;
+}
+
+/** Records the human's yes (terminal or chat poll). */
+function grant(root, state, { reopened, name }) {
+  if (reopened) writeState(root, { ...state, reopened: { ...state.reopened, human: true } });
+  else setDetour(root, state.active_brief, { ...state.detour, human: true });
+  return done(fill(reopened ? texts(root).reopenAllowed : texts(root).allowed, name));
+}
+
+/**
+ * The human's yes for a detour, or a reopened workstream's fix (QUA-117), that changes the rules;
+ * `confirm(question)` only in an interactive terminal.
+ */
+export async function allow(root, { tty = false, confirm } = {}) {
+  const T = texts(root);
+  const { state } = readState(root);
+  const target = awaited(state);
+  if (!target) return refused(T.noDetour);
+  if (!tty || typeof confirm !== "function") return refused(T.human);
+  if (!(await confirm(fill(target.reopened ? T.reopenConfirm : T.confirm, target.name)))) return refused(T.refused);
+  return grant(root, state, target);
+}
+
+/** The `drwil-detour` poll of the yes awaited, to ask as is in the chat (QUA-117); writes nothing. */
+export function detourPoll(root) {
+  const T = texts(root);
+  const target = awaited(readState(root).state);
+  if (!target) return refused(T.noDetour);
+  const question = [`drwil-detour ${target.name}`, fill(target.reopened ? T.reopenAsk : T.ask, target.name)].join("\n");
+  const options = T.options.map((o) => ({ ...o }));
+  return { ...done(""), poll: { questions: [{ header: "drwil-detour", question, options }] }, data: target };
+}
+
+/**
+ * Records the yes the human gave by answering the poll, called by the hook only (QUA-117): the same detour, or the
+ * same reopening, must still await it. `{ code, message }`, or null (nothing recorded).
+ */
+export function allowFromPoll(root, data) {
+  const { state } = readState(root);
+  const target = awaited(state);
+  if (!target || target.name !== data?.name || target.reopened !== data.reopened) return null;
+  return grant(root, state, target);
+}
+
+/** Value of the `--name value` option in `args`, or undefined. */
+function option(args, name) {
+  const i = args.indexOf(name);
+  return i >= 0 && i + 1 < args.length ? args[i + 1] : undefined;
+}
+
+/** Entry point: `node .githooks/detour.mjs open|resume|allow …`. Returns the exit code. */
+export async function main(args, root) {
+  let r;
+  if (args[0] === "open") {
+    const files = (option(args, "--files") ?? "").split(",").filter(Boolean);
+    r = open(root, args[1], { title: option(args, "--title"), files });
+  } else if (args[0] === "resume") r = resume(root);
+  else if (args[0] === "allow") {
+    const tty = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+    const confirm = async (question) => {
+      const { createInterface } = await import("node:readline/promises");
+      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      try {
+        return (await rl.question(question)).trim() === "DETOUR";
+      } finally {
+        rl.close();
+      }
+    };
+    r = await allow(root, { tty, confirm });
+  } else {
+    console.error(texts(root).usage);
+    return 2;
+  }
+  (r.code === 0 ? console.log : console.error)(`${r.code === 0 ? "✓" : "✗"} ${r.message}`);
+  return r.code;
+}
+
+if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {
+  // Never a top-level await: a module loaded on demand that imports this file back would wait forever (QUA-249).
+  main(process.argv.slice(2), stateRoot()).then((code) => {
+    process.exitCode = code;
+  });
+}

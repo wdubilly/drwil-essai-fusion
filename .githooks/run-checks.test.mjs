@@ -1,0 +1,1223 @@
+import { after, afterEach, test } from "node:test";
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+// Voir scope-gate.test.mjs : des GIT_* hérités feraient agir les tests sur le dépôt qui les lance.
+for (const nom of Object.keys(process.env)) if (nom.startsWith("GIT_")) delete process.env[nom];
+// La passe d'une PR en CI demande la reprise (QUA-250) : héritée, elle ferait reprendre les passes de ces tests.
+delete process.env.DRWIL_CI_REUSE;
+
+const SCRIPT = fileURLToPath(new URL("./run-checks.mjs", import.meta.url));
+// Les dossiers gardés par un contrôle en échec (QUA-133) vont dans un temporaire propre à ce fichier, supprimé à la fin.
+const racineTemp = mkdtempSync(join(tmpdir(), "drwil-run-checks-racine-"));
+process.env.TMPDIR = racineTemp;
+after(() => rmSync(racineTemp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
+let dossiers = [];
+afterEach(() => {
+  for (const d of dossiers) rmSync(d, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  dossiers = [];
+});
+const tmp = () => {
+  const dir = mkdtempSync(join(tmpdir(), "drwil-run-checks-"));
+  dossiers.push(dir);
+  return dir;
+};
+function git(racine, ...args) {
+  const r = spawnSync("git", args, { cwd: racine, encoding: "utf8" });
+  assert.equal(r.status, 0, `git ${args.join(" ")} : ${r.stderr}`);
+}
+
+/**
+ * Lance run-checks sur un projet temporaire (dépôt git sur une branche de travail si `depot`).
+ * check-docs y est un bouchon : ce test éprouve l'adaptateur, pas les contrôles (engine.test.mjs).
+ * HOME temporaire : un gitleaks de ~/.local/bin ne s'invite pas ; DRWIL_HOOK et CI fixés par le test.
+ */
+function lancer(fichiers, { depot = true, docsOk = true, env = {}, indexer = [], valider = false } = {}) {
+  const racine = tmp();
+  const tout = {
+    ".githooks/check-docs.mjs": `process.exit(${docsOk ? 0 : 1});\n`,
+    ".githooks/check-contract-tests.mjs": "process.exit(0);\n",
+    ".githooks/check-architecture.mjs": "process.exit(0);\n",
+    ...fichiers,
+  };
+  for (const [chemin, contenu] of Object.entries(tout)) {
+    mkdirSync(dirname(join(racine, chemin)), { recursive: true });
+    writeFileSync(join(racine, chemin), contenu);
+  }
+  if (depot) {
+    git(racine, "init", "-q", "-b", "travail");
+    if (indexer.length) git(racine, "add", ...indexer);
+    if (valider) {
+      git(racine, "add", "-A");
+      git(racine, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x");
+    }
+  }
+  const r = passe(racine, { env });
+  return { ...r, racine, detail: detail(racine) };
+}
+/** Une passe de run-checks sur une racine déjà préparée (`args` : ses options). */
+function passe(racine, { env = {}, args = [] } = {}) {
+  const base = {
+    ...process.env,
+    HOME: tmp(),
+    USERPROFILE: tmp(),
+    CI: "",
+    DRWIL_HOOK: "",
+    DRWIL_PUSH_REFS: "",
+    DRWIL_PUSH_TAGS_ONLY: "",
+    DRWIL_PUSH_NO_BRANCH: "",
+    DRWIL_PUSH_COMMITS: "",
+    DRWIL_KIT_UPDATE: "",
+    TMPDIR: tmp(),
+  };
+  // DRWIL_ROOT : sans elle, run-checks jugerait le dépôt drwil (parent de son .githooks/).
+  // Dossier courant ailleurs : seule la racine compte, comme pour un hook lancé depuis une couche.
+  const r = spawnSync(process.execPath, [SCRIPT, ...args], { cwd: tmp(), encoding: "utf8", env: { ...base, DRWIL_ROOT: racine, ...env } });
+  return { ...r, detail: detail(racine) };
+}
+/** Le rapport complet que run-checks écrit à côté de sa sortie courte (QUA-126) ; vide s'il manque. */
+const DETAIL = ".drwil/evidence/run-checks.log";
+const detail = (racine) => (existsSync(join(racine, DETAIL)) ? readFileSync(join(racine, DETAIL), "utf8") : "");
+
+test("racine du projet, pas le dossier courant : contrôles annoncés, non exécutés signalés, bilan OK", () => {
+  const r = lancer(
+    { ".drwil/ia-first.json": JSON.stringify({ checks: [{ name: "projet", run: "node -e 0" }] }) },
+    { env: { DRWIL_HOOK: "pre-commit" } },
+  );
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.detail, /^\[ia-first\] chemins et contrats cités dans la doc…$/m);
+  assert.match(r.detail, /^\[ia-first\] projet…$/m);
+  assert.match(r.detail, /^\[ia-first\] ⚠ non exécuté : couverture CI de chaque contrôle \(QUA-013\) \(aucune CI configurée/m);
+  assert.match(
+    r.stdout,
+    /^\[ia-first\] contrôles exécutés : OK \(1 avertissement\(s\), non exécutés compris — détail : \.drwil\/evidence\/run-checks\.log\) — les plus lents : [^\n]+\n$/,
+    "réussite : la seule ligne de résumé",
+  );
+  assert.match(r.detail, /contrôles exécutés : OK \(1 avertissement/, "le rapport complet finit par le même résumé");
+});
+
+test("en anglais : échecs listés (message du contrôle ou son nom), aucun contrôle du projet déclaré", () => {
+  const r = lancer(
+    { ".drwil/ia-first.json": JSON.stringify({ lang: "en", scopeGate: "blocking", checks: [] }), "src/a.js": "" },
+    { docsOk: false, env: { DRWIL_HOOK: "pre-commit" }, indexer: ["src/a.js"] },
+  );
+  assert.equal(r.status, 1);
+  assert.match(
+    r.detail,
+    /^\[ia-first\] ⚠ not run: project checks \(lint, tests…\) \(none declared in \.drwil\/ia-first\.json → checks\)$/m,
+  );
+  assert.match(r.stdout, /^\[ia-first\] ✗ failed: paths and contracts cited in docs$/m);
+  assert.match(r.stdout, /^\[ia-first\] ✗ failed: brief scope: 1 problem\(s\) \(blocking gate\)$/m);
+  assert.doesNotMatch(r.stdout, /checks run: OK/);
+});
+
+test("sans configuration, hors dépôt git, au commit : rien d'indexé, contrôles du projet absents", () => {
+  const r = lancer({}, { depot: false, env: { DRWIL_HOOK: "pre-commit" } });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.detail, /⚠ non exécuté : contrôles du projet \(lint, tests…\) \(aucun déclaré/);
+});
+
+test("audits : périmé signalé (français), récent, sans date ou sans ligne de scan ignorés", () => {
+  let r = lancer({
+    "docs/audit-risques.md": "# Audit\n\n> Dernier scan : 2020-01-01\n",
+    "docs/decouverte-valeur.md": "# Valeur\n\n> Dernier scan : 2999-01-01\n",
+  });
+  assert.match(r.detail, /⚠ non exécuté : audit périmé \(docs\/audit-risques\.md, vieux de \d+ jours\) : à relancer/);
+  assert.doesNotMatch(r.detail, /decouverte-valeur/);
+  r = lancer({
+    ".drwil/ia-first.json": JSON.stringify({ lang: "en" }),
+    "docs/audit-risks.md": "# Risks\n\nno scan line\n",
+    "docs/value-discovery.md": "# Value\n\n> Last scan: never\n",
+  });
+  assert.doesNotMatch(r.detail, /stale audit/);
+  r = lancer(
+    { ".drwil/ia-first.json": JSON.stringify({ lang: "en" }), "docs/value-discovery.md": "> Last scan: 2020-01-01\n" },
+    { env: { DRWIL_HOOK: "pre-commit" } },
+  );
+  assert.match(r.detail, /⚠ not run: stale audit \(docs\/value-discovery\.md, \d+ days old\): time to re-run/);
+  assert.match(r.stdout, /checks run: OK/);
+});
+
+test("QUA-036 : rappels d'intentions : périmée signalée sans bloquer, en anglais aussi", () => {
+  let r = lancer({
+    "docs/intentions/vieille.md": "# I\n\n**Statut** : proposée le 2020-01-01.\n",
+    "docs/intentions/neuve.md": "# I\n\n**Statut** : proposée le 2999-01-01.\n",
+  });
+  assert.match(r.detail, /\[ia-first\] ⚠ intention sans revue depuis \d+ jours \(docs\/intentions\/vieille\.md\) : la revoir/);
+  assert.doesNotMatch(r.detail, /neuve\.md|non exécuté : intention/);
+  r = lancer({ ".drwil/ia-first.json": JSON.stringify({ lang: "en" }), "docs/intentions/old.md": "**Status**: proposed on 2020-01-01.\n" });
+  assert.match(r.detail, /⚠ intent not reviewed for \d+ days \(docs\/intentions\/old\.md\): review it/);
+});
+
+test("QUA-036 : au commit, une fiche supprimée sans que son intention soit touchée est signalée, en anglais aussi", () => {
+  for (const [lang, motif] of [
+    ["fr", /⚠ la fiche docs\/projects\/a\.md est supprimée sans que son intention docs\/intentions\/i\.md soit touchée/],
+    ["en", /⚠ brief docs\/projects\/a\.md is deleted without touching its intent docs\/intentions\/i\.md/],
+  ]) {
+    const racine = tmp();
+    const ecrire = (chemin, contenu) => {
+      mkdirSync(dirname(join(racine, chemin)), { recursive: true });
+      writeFileSync(join(racine, chemin), contenu);
+    };
+    ecrire(".githooks/check-docs.mjs", "process.exit(0);\n");
+    ecrire(".githooks/check-contract-tests.mjs", "process.exit(0);\n");
+    ecrire(".drwil/ia-first.json", JSON.stringify({ lang }));
+    ecrire("docs/intentions/i.md", "# I\n\n**Statut** : proposée le 2999-01-01.\n");
+    ecrire("docs/projects/a.md", "# A\n\n**Intention** : `docs/intentions/i.md`\n");
+    const g = (...args) => spawnSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: racine, encoding: "utf8" });
+    g("init", "-q", "-b", "travail");
+    g("add", "-A");
+    g("commit", "-qm", "base");
+    g("rm", "-q", "docs/projects/a.md");
+    const env = { ...process.env, HOME: tmp(), USERPROFILE: tmp(), CI: "", DRWIL_HOOK: "pre-commit", DRWIL_ROOT: racine };
+    spawnSync(process.execPath, [SCRIPT], { cwd: tmp(), encoding: "utf8", env });
+    assert.match(detail(racine), motif, lang);
+  }
+});
+
+test("QUA-039 : un ID cité dans un message est suivi de son titre, lu dans le registre", () => {
+  const r = lancer(
+    {
+      "docs/contracts.md": "## QUA-004 — Seuil de couverture de test\n**Règle** : r.\n",
+      ".drwil/ia-first.json": JSON.stringify({ checks: [{ name: "couverture (QUA-004)", run: "node -e 0", paths: ["src/**"] }] }),
+    },
+    { env: { DRWIL_HOOK: "pre-commit" }, indexer: ["docs/contracts.md"] },
+  );
+  assert.match(r.detail, /non exécuté : couverture \(QUA-004 — Seuil de couverture de test\)/);
+});
+
+test("QUA-013 : hors commit (push, CI), un contrôle non exécuté fait échouer ; au commit, simple avertissement", () => {
+  const sansCi = { ".drwil/ia-first.json": JSON.stringify({ checks: [{ name: "projet", run: "node -e 0" }] }) };
+  let r = lancer(sansCi, { env: { CI: "true" } });
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stdout, /^\[ia-first\] ✗ échec : non exécuté : couverture CI de chaque contrôle \(QUA-013\) \(aucune CI configurée/m);
+  assert.doesNotMatch(r.stdout, /contrôles exécutés : OK/);
+  r = lancer(sansCi, { env: { DRWIL_HOOK: "pre-commit" } });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.detail, /⚠ non exécuté : couverture CI/);
+});
+
+test("QUA-013 : hors CI, un projet non configuré (pas de CI) reste un avertissement visible", () => {
+  const r = lancer({ ".drwil/ia-first.json": JSON.stringify({ checks: [{ name: "projet", run: "node -e 0" }] }) });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.detail, /⚠ non exécuté : couverture CI/);
+});
+
+test("QUA-013 : hors commit, aucun contrôle du projet déclaré fait échouer, en anglais aussi ; l'audit périmé reste un avertissement", () => {
+  let r = lancer({ ".drwil/ia-first.json": JSON.stringify({ lang: "en", checks: [] }) }, { env: { CI: "true" } });
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stdout, /^\[ia-first\] ✗ failed: not run: project checks \(lint, tests…\) \(none declared/m);
+  r = lancer({ ".drwil/ia-first.json": JSON.stringify({ lang: "en" }), "docs/value-discovery.md": "> Last scan: 2020-01-01\n" });
+  assert.match(r.detail, /⚠ not run: stale audit/);
+  assert.doesNotMatch(r.stdout, /✗ failed: not run: stale audit/);
+});
+
+// Rejoue l'incident du 2026-10-18 : un pre-push lancé depuis un worktree reçoit GIT_DIR (le dossier
+// du worktree dans .git/worktrees/) ; un test qui fait `git init` ailleurs sans le retirer
+// réinitialisait ce dossier et écrivait core.bare=true dans la configuration commune.
+test("QUA-056 : un push depuis un worktree laisse le dépôt principal identique (configuration, branches, index, arbre)", () => {
+  const principal = tmp();
+  const distant = tmp();
+  const worktree = join(tmp(), "wt");
+  const marque = join(tmp(), "lance");
+  const ailleurs = tmp();
+  git(principal, "init", "-q", "-b", "main");
+  git(principal, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "a");
+  git(distant, "init", "-q", "--bare");
+  git(principal, "config", "core.hooksPath", dirname(SCRIPT));
+  git(principal, "worktree", "add", "-q", worktree, "-b", "travail");
+  // Un contrôle « hostile », comme un fichier de test qui ne retire pas les GIT_* hérités.
+  const hostile = [
+    'import { spawnSync } from "node:child_process";',
+    'import { writeFileSync } from "node:fs";',
+    'import { join } from "node:path";',
+    "const d = process.argv[3];",
+    'spawnSync("git", ["init", "-q", "-b", "workstream/kit-installation", d]);',
+    'writeFileSync(join(d, "f.txt"), "x");',
+    'spawnSync("git", ["add", "f.txt"], { cwd: d });',
+    'writeFileSync(process.argv[2], "oui");',
+  ].join("\n");
+  for (const [chemin, contenu] of Object.entries({
+    ".githooks/check-docs.mjs": "process.exit(0);\n",
+    ".githooks/check-contract-tests.mjs": "process.exit(0);\n",
+    ".githooks/check-architecture.mjs": "process.exit(0);\n",
+    "hostile.mjs": hostile,
+    ".drwil/ia-first.json": JSON.stringify({
+      mode: "minimal",
+      checks: [{ name: "hostile", run: `node hostile.mjs "${marque}" "${ailleurs}"` }],
+    }),
+  })) {
+    mkdirSync(dirname(join(worktree, chemin)), { recursive: true });
+    writeFileSync(join(worktree, chemin), contenu);
+  }
+  const photo = () =>
+    [
+      readFileSync(join(principal, ".git", "config"), "utf8"),
+      ...[
+        ["branch", "-a"],
+        ["status", "--porcelain"],
+        ["worktree", "list", "--porcelain"],
+      ].map((args) => spawnSync("git", args, { cwd: principal, encoding: "utf8" }).stdout),
+      spawnSync("git", ["status", "--porcelain"], { cwd: worktree, encoding: "utf8" }).stdout,
+    ].join("\n--\n");
+  const avant = photo();
+  const r = spawnSync("git", ["push", "-q", distant, "travail"], {
+    cwd: worktree,
+    encoding: "utf8",
+    env: { ...process.env, DRWIL_ROOT: worktree, HOME: tmp(), USERPROFILE: tmp(), CI: "", DRWIL_HOOK: "" },
+  });
+  assert.equal(existsSync(marque), true, `le pre-push n'a pas lancé le contrôle : ${r.stdout}${r.stderr}`);
+  assert.equal(photo(), avant);
+});
+
+test("QUA-119 : avec `parallel`, rapport dans l'ordre de la liste, sorties groupées par contrôle, verdict d'une exécution en série", () => {
+  const lent = "node -e \"setTimeout(()=>console.log('sortie lente'),400)\"";
+  const r = lancer(
+    {
+      ".drwil/ia-first.json": JSON.stringify({
+        parallel: true,
+        build: "node -e \"console.log('compilé')\"",
+        checks: [
+          { id: "lent", name: "Lent", run: lent, needsBuild: true },
+          { id: "casse", name: "Cassé (QUA-999)", run: "node -e \"console.log('trace');process.exit(1)\"" },
+          { id: "reporte", name: "Reporté", run: "node -e 0", paths: ["src/**"] },
+        ],
+      }),
+    },
+    { env: { DRWIL_HOOK: "pre-commit" } },
+  );
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  const lignes = r.detail.split("\n");
+  const rang = (re) => lignes.findIndex((l) => re.test(l));
+  assert.ok(rang(/^\[ia-first\] Lent…$/) < rang(/^sortie lente$/));
+  assert.ok(rang(/^sortie lente$/) < rang(/^\[ia-first\] Cassé \(QUA-999\)…$/));
+  assert.ok(rang(/^trace$/) > rang(/^\[ia-first\] Cassé/));
+  assert.match(r.detail, /^\[ia-first\] ⚠ non exécuté : Reporté \(/m);
+  assert.match(r.stdout, /^\[ia-first\] ✗ échec : Cassé \(QUA-999\)/m);
+  assert.doesNotMatch(r.stdout, /✗ échec : Lent/);
+});
+
+test("QUA-121 : le workflow saute le push d'une branche à PR ouverte, jamais master, et garde noms exigés et alerte", () => {
+  const wf = readFileSync(join(dirname(SCRIPT), "..", ".github", "workflows", "ia-first.yml"), "utf8");
+  const job = (nom) => wf.split(/^ {2}(?=[\w-]+:$)/m).find((b) => b.startsWith(`${nom}:`)) ?? "";
+  assert.match(wf, /^on: \[push, pull_request, workflow_dispatch\]$/m);
+  const calcul = job("matrice-os");
+  assert.match(calcul, /gh pr list .*--head "\$BRANCHE" --state open/);
+  assert.match(calcul, /\|\| ouvertes=0/, "GitHub muet : le push teste");
+  assert.match(calcul, /\[ "\$REF" != "refs\/heads\/\$PRINCIPALE" \]/, "master jamais sauté");
+  assert.match(calcul, /"tester":false/, "push sauté : kit-tests ne teste pas");
+  assert.match(job("checks"), /needs: \[matrice-os, plan, shards\]\n\s+if: always\(\) && needs\.matrice-os\.outputs\.saute != 'true'/);
+  assert.match(job("kit-tests"), /needs: matrice-os/);
+  assert.match(job("kit-tests"), /name: kit-tests \(\$\{\{ matrix\.os \}\}\)/);
+  assert.match(job("alert-if-ci-broken"), /needs: \[checks, kit-tests\]/);
+  assert.match(job("alert-if-ci-broken"), /github\.event_name == 'push'/);
+});
+
+test("QUA-123 : le job checks joue la suite une seule fois sur Node 22, sans npm test séparé ; kit-tests garde Node 24", () => {
+  const wf = readFileSync(join(dirname(SCRIPT), "..", ".github", "workflows", "ia-first.yml"), "utf8");
+  const job = (nom) => wf.split(/^ {2}(?=[\w-]+:$)/m).find((b) => b.startsWith(`${nom}:`)) ?? "";
+  const checks = job("checks");
+  assert.equal(checks.match(/node-version: \d+/g)?.join(), "node-version: 22");
+  assert.doesNotMatch(checks, /npm test/);
+  assert.match(checks, /run: node \.githooks\/run-checks\.mjs/);
+  assert.match(job("kit-tests"), /node-version: 24/);
+});
+
+test("QUA-126 : sortie limitée aux contrôles en échec (contrat nommé, fin de leur sortie) et au résumé ; détail complet dans un fichier", () => {
+  const long = `node -e "for(let i=1;i<=50;i++)console.log('ligne '+i);process.exit(1)"`;
+  const cfg = {
+    checks: [
+      { name: "bavard", run: "node -e \"console.log('sortie de réussite')\"" },
+      { name: "couverture (QUA-004)", run: long },
+    ],
+  };
+  const fichiers = {
+    "docs/contracts.md": "## QUA-004 — Seuil de couverture de test\n**Règle** : r.\n",
+    ".drwil/ia-first.json": JSON.stringify(cfg),
+  };
+  const r = lancer(fichiers);
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  const lignes = r.stdout.trimEnd().split("\n");
+  assert.equal(lignes[0], "[ia-first] ✗ échec : couverture (QUA-004 — Seuil de couverture de test)", "le contrat fautif, avec son libellé");
+  assert.equal(lignes[1], "    … 10 ligne(s) plus haut, dans .drwil/evidence/run-checks.log");
+  assert.equal(lignes[2], "    ligne 11");
+  assert.equal(lignes.at(-2), "    ligne 50");
+  assert.match(
+    lignes.at(-1),
+    /^\[ia-first\] contrôles exécutés : 1 en échec, \d+ avertissement\(s\) — détail : \.drwil\/evidence\/run-checks\.log/,
+  );
+  assert.equal(lignes.length, 43, "ni annonce, ni avertissement, ni sortie d'un contrôle réussi");
+  assert.doesNotMatch(
+    lignes.slice(0, -1).join("\n"),
+    /sortie de réussite|bavard|…$/m,
+    "le résumé seul peut nommer un contrôle réussi, parmi les plus lents",
+  );
+  assert.match(r.detail, /^\[ia-first\] bavard…\nsortie de réussite$/m, "le détail garde tout, dans l'ordre");
+  assert.match(r.detail, /^ligne 1$/m);
+  assert.match(r.detail, /^\[ia-first\] ✗ échec : couverture/m);
+  const ci = lancer(fichiers, { env: { CI: "true" } });
+  assert.match(ci.stdout, /^ {4}ligne 1$/m, "en CI, toute la sortie : le fichier ne survit pas au job");
+  assert.doesNotMatch(ci.stdout, /plus haut/);
+  assert.match(
+    ci.stdout,
+    /^\[ia-first\] ✗ échec : non exécuté : couverture CI de chaque contrôle/m,
+    "non exécuté hors commit : un échec visible (QUA-013)",
+  );
+});
+
+test("QUA-126 : un rapport impossible à écrire ne change pas le verdict ; un échec sans sortie reste nommé", () => {
+  const r = lancer(
+    { ".drwil/evidence": "un fichier, pas un dossier", ".drwil/ia-first.json": JSON.stringify({ checks: [] }) },
+    { docsOk: false },
+  );
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /^\[ia-first\] ✗ échec : chemins et contrats cités dans la doc$/m);
+  assert.match(r.stdout, /^\[ia-first\] contrôles exécutés : 1 en échec/m);
+  const ok = lancer({
+    ".drwil/evidence": "fichier",
+    ".drwil/ia-first.json": JSON.stringify({ checks: [{ name: "p", run: "node -e 0" }] }),
+  });
+  assert.equal(ok.status, 0, ok.stdout + ok.stderr);
+  assert.match(ok.stdout, /contrôles exécutés : OK/);
+});
+
+test("QUA-127 : le résumé compte chaque avertissement non bloquant et donne le chemin du détail, en anglais aussi", () => {
+  const fichiers = {
+    ".drwil/ia-first.json": JSON.stringify({ checks: [{ name: "p", run: "node -e 0", paths: ["src/**"] }] }),
+    "docs/audit-risques.md": "> Dernier scan : 2020-01-01\n",
+    "docs/intentions/vieille.md": "# I\n\n**Statut** : proposée le 2020-01-01.\n",
+  };
+  const r = lancer(fichiers, { env: { DRWIL_HOOK: "pre-commit" } });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  // Reporté (p), couverture CI absente, audit périmé, intention sans revue : quatre, aucun tu.
+  const avertissements = r.detail.split("\n").filter((l) => l.startsWith("[ia-first] ⚠"));
+  assert.equal(avertissements.length, 4, r.detail);
+  assert.match(
+    r.stdout,
+    /^\[ia-first\] contrôles exécutés : OK \(4 avertissement\(s\), non exécutés compris — détail : \.drwil\/evidence\/run-checks\.log\) — les plus lents : [^\n]+\n$/,
+  );
+  const en = lancer(
+    { ...fichiers, ".drwil/ia-first.json": JSON.stringify({ lang: "en", checks: [{ name: "p", run: "node -e 0", paths: ["src/**"] }] }) },
+    {
+      docsOk: false,
+      env: { DRWIL_HOOK: "pre-commit" },
+    },
+  );
+  assert.match(en.stdout, /^\[ia-first\] checks run: 1 failed, 3 warning\(s\) — detail: \.drwil\/evidence\/run-checks\.log/m);
+  const ok = lancer({ ".drwil/ia-first.json": JSON.stringify({ lang: "en", checks: [{ name: "p", run: "node -e 0" }] }) });
+  assert.match(
+    ok.stdout,
+    /^\[ia-first\] checks run: OK \(\d+ warning\(s\), not run included — detail: \.drwil\/evidence\/run-checks\.log\)( — slowest: .+)?$/m,
+  );
+  const longue = lancer(
+    {
+      ".drwil/ia-first.json": JSON.stringify({
+        lang: "en",
+        checks: [{ name: "x", run: `node -e "for(let i=0;i<45;i++)console.log(i);process.exit(1)"` }],
+      }),
+    },
+    {},
+  );
+  assert.match(longue.stdout, /^ {4}… 5 line\(s\) above, in \.drwil\/evidence\/run-checks\.log$/m);
+});
+
+test("QUA-134 : un contrôle qui laisse des fichiers dans son dossier temporaire est nommé et compté comme avertissement, sans faire échouer ; un échec dit où est gardé le dossier", () => {
+  const base = tmp();
+  const fuit = (code) =>
+    `node -e "require('fs').writeFileSync(require('path').join(process.env.TMPDIR,'reste'),'x');process.exit(${code})"`;
+  const config = (lang, code) => ({ ".drwil/ia-first.json": JSON.stringify({ lang, checks: [{ name: "fuyard", run: fuit(code) }] }) });
+  const ok = lancer(config("fr", 0), { env: { TMPDIR: base } });
+  assert.equal(ok.status, 0, ok.stdout + ok.stderr);
+  assert.match(ok.detail, /^\[ia-first\] ⚠ fuyard laisse 1 élément\(s\) dans son dossier temporaire/m);
+  assert.match(ok.stdout, /contrôles exécutés : OK \(3 avertissement\(s\)/, "la fuite est comptée avec les non exécutés");
+  assert.equal(readdirSync(base).length, 0, "passe réussie : rien ne reste");
+  const ko = lancer(config("en", 1), { env: { TMPDIR: base } });
+  assert.equal(ko.status, 1);
+  const gardes = readdirSync(base);
+  assert.equal(gardes.length, 1);
+  assert.ok(ko.stdout.includes(`temporary folders of the failed checks kept for diagnosis: ${join(base, gardes[0])}`), ko.stdout);
+});
+
+test("QUA-134 : une racine temporaire qu'on ne parvient pas à supprimer est un avertissement compté, jamais un échec", {
+  skip: process.platform === "win32" || process.getuid?.() === 0,
+}, () => {
+  const base = tmp();
+  const verrou = `node -e "require('fs').chmodSync(process.env.TMPDIR + '/..', 0o500)"`;
+  const r = lancer({ ".drwil/ia-first.json": JSON.stringify({ checks: [{ name: "verrou", run: verrou }] }) }, { env: { TMPDIR: base } });
+  chmodSync(join(base, readdirSync(base)[0]), 0o700);
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.detail, /^\[ia-first\] ⚠ dossier temporaire de la passe non supprimé/m);
+});
+
+test("QUA-127 : une ligne [ia-first-warning] dans la sortie d'un contrôle réussi est un avertissement compté, sans faire échouer", () => {
+  const passe = (commande) => lancer({ ".drwil/ia-first.json": JSON.stringify({ checks: [{ name: "mesure", run: commande }] }) });
+  const compte = (r) => Number(r.stdout.match(/OK \((\d+) avertissement/)[1]);
+  const sans = passe("node -e 0");
+  const avec = passe(`node -e "console.log('[ia-first-warning] budget dépassé : 2000 ms')"`);
+  assert.equal(avec.status, 0, avec.stdout + avec.stderr);
+  assert.match(avec.detail, /^\[ia-first\] ⚠ budget dépassé : 2000 ms$/m);
+  assert.equal(compte(avec), compte(sans) + 1);
+});
+
+test("QUA-136 : chaque contrôle exécuté a sa durée au détail, du plus lent au plus rapide en fin de fichier ; le résumé nomme les trois plus lents", () => {
+  // Aucune attente sur la durée réelle d'un contrôle : sous charge, les contrôles réels de la passe (gitleaks…) s'intercalent. On
+  // vérifie la cohérence des durées consignées (tri décroissant, résumé = trois premières du classement), pas leur valeur.
+  const config = (lang) => ({
+    ".drwil/ia-first.json": JSON.stringify({
+      lang,
+      checks: ["rapide", "moyen", "lent", "pas-si-rapide"].map((name) => ({ name, run: "node -e 0" })),
+    }),
+  });
+  const fr = lancer(config("fr"));
+  assert.equal(fr.status, 0, fr.stdout + fr.stderr);
+  assert.match(fr.detail, /^\[ia-first\] lent : durée : \d+ ms$/m);
+  assert.doesNotMatch(fr.detail, /^\[ia-first\] contrôles du projet \(lint, tests…\) : durée/m, "un contrôle non exécuté n'a pas de durée");
+  const classe = fr.detail
+    .split("contrôles du plus lent au plus rapide")[1]
+    .split("\n")
+    .slice(1)
+    .filter(Boolean)
+    .map((l) => l.match(/^\s*(\d+) ms\s+(.+)$/));
+  assert.ok(classe.every(Boolean), "chaque ligne du classement : durée puis nom");
+  const entrees = classe.map((m) => ({ ms: Number(m[1]), nom: m[2] }));
+  for (const nom of ["rapide", "moyen", "lent", "pas-si-rapide"]) {
+    const ligne = fr.detail.match(new RegExp(`^\\[ia-first\\] ${nom} : durée : (\\d+) ms$`, "m"));
+    assert.equal(entrees.find((e) => e.nom === nom)?.ms, Number(ligne[1]), `${nom} : même durée au détail et au classement`);
+  }
+  assert.deepEqual(
+    entrees.map((e) => e.ms),
+    entrees.map((e) => e.ms).toSorted((a, b) => b - a),
+    "du plus lent au plus rapide",
+  );
+  const trois = entrees
+    .slice(0, 3)
+    .map((e) => `${e.nom} ${e.ms} ms`)
+    .join(", ");
+  assert.ok(fr.stdout.endsWith(`— les plus lents : ${trois}\n`), fr.stdout);
+  assert.match(fr.detail, /en passe parallèle, elles se recouvrent/);
+  const en = lancer(config("en"));
+  assert.match(en.detail, /^\[ia-first\] lent : duration: \d+ ms$/m);
+  assert.match(en.stdout, /— slowest: (.+ \d+ ms, ){2}.+ \d+ ms\n$/);
+});
+
+test("QUA-136 : en CI, le classement complet des durées est dans la sortie, avant le résumé ; hors CI, seul le résumé nomme les trois plus lents", () => {
+  const fichiers = {
+    ".drwil/ia-first.json": JSON.stringify({
+      lang: "fr",
+      checks: ["a", "b", "c", "d", "e"].map((name) => ({ name, run: "node -e 0" })),
+    }),
+  };
+  const ci = lancer(fichiers, { env: { CI: "true" } });
+  const lignes = ci.stdout.split("\n");
+  const debut = lignes.findIndex((l) => /^\[ia-first\] contrôles du plus lent au plus rapide/.test(l));
+  assert.ok(debut >= 0, ci.stdout);
+  const classe = lignes.slice(debut + 1).filter((l) => /^ {2}\d+ ms {2}/.test(l));
+  const fin = lignes.findIndex((l) => /— les plus lents :/.test(l));
+  assert.ok(debut < fin, "le classement précède le résumé");
+  const noms = classe.map((l) => l.replace(/^ {2}\d+ ms {2}/, ""));
+  for (const nom of ["a", "b", "c", "d", "e"]) assert.ok(noms.includes(nom), `${nom} au classement`);
+  assert.ok(classe.length > 3, "plus que les trois plus lents");
+  assert.doesNotMatch(lancer(fichiers).stdout, /contrôles du plus lent au plus rapide/);
+});
+
+const VERDICTS = ".drwil/evidence/run-checks-verdicts.json";
+
+test("QUA-140 : une passe hors hook consigne le verdict ok ou fail de chaque contrôle avec l'empreinte de l'arbre ; ni non exécuté, ni passe de hook", async () => {
+  const fichiers = {
+    ".drwil/ia-first.json": JSON.stringify({
+      checks: [
+        { id: "vert", run: "node -e 0" },
+        { id: "rouge", run: "node -e \"console.log('cause');process.exit(1)\"" },
+        { id: "reporte", run: "node -e 0", paths: ["src/**"] },
+      ],
+    }),
+  };
+  const r = lancer(fichiers, { valider: true });
+  const consigne = JSON.parse(readFileSync(join(r.racine, VERDICTS), "utf8"));
+  assert.equal(consigne.checks.vert.status, "ok");
+  assert.equal(consigne.checks.rouge.status, "fail");
+  assert.match(consigne.checks.rouge.output, /cause/);
+  assert.ok(
+    !("secrets" in consigne.checks) || consigne.checks.secrets.reusable === false,
+    "secrets hors CI ne juge pas ce que verify juge",
+  );
+  assert.match(consigne.ranAt, /^\d{4}-\d{2}-\d{2}T/);
+  const { treeFingerprint } = await import("./engine.mjs");
+  assert.equal(consigne.fingerprint, treeFingerprint(r.racine));
+  const hook = lancer(fichiers, { valider: true, env: { DRWIL_HOOK: "pre-commit" } });
+  assert.ok(!existsSync(join(hook.racine, VERDICTS)), "une passe de hook ne laisse rien à reprendre");
+  const push = lancer(fichiers, { valider: true, env: { DRWIL_PUSH_REFS: "refs/heads/travail" } });
+  assert.ok(!existsSync(join(push.racine, VERDICTS)), "une passe de pre-push non plus");
+});
+
+test("QUA-140 : un arbre changé pendant la passe, ou sans commit, ne laisse aucun verdict", () => {
+  const ecrivain = { id: "ecrit", run: "node -e \"require('fs').writeFileSync('intrus.txt','x')\"" };
+  const change = lancer({ ".drwil/ia-first.json": JSON.stringify({ checks: [ecrivain] }) }, { valider: true });
+  assert.ok(!existsSync(join(change.racine, VERDICTS)), "le verdict n'est pas pris sur un seul arbre");
+  const sansCommit = lancer({ ".drwil/ia-first.json": JSON.stringify({ checks: [{ id: "vert", run: "node -e 0" }] }) });
+  assert.ok(!existsSync(join(sansCommit.racine, VERDICTS)), "sans commit : pas d'empreinte, rien de repris");
+  const bloque = lancer(
+    { ".drwil/ia-first.json": JSON.stringify({ checks: [{ id: "vert", run: "node -e 0" }] }), ".drwil/evidence": "fichier" },
+    { valider: true },
+  );
+  assert.equal(bloque.status, 0, "des verdicts qui ne s'écrivent pas ne changent pas le verdict de la passe");
+});
+
+const compte = (racine) => (existsSync(join(racine, "compteur.log")) ? readFileSync(join(racine, "compteur.log"), "utf8").length : 0);
+const consigne = (racine) => JSON.parse(readFileSync(join(racine, VERDICTS), "utf8"));
+
+test("QUA-141 : hors hook et hors CI, un contrôle « ok » dont les fichiers du paths n'ont pas changé est repris, le dit, et ne reçoit pas l'empreinte de l'arbre", () => {
+  const joue = (nom) => `node -e "require('fs').appendFileSync('compteur.log','x')" ${nom}`;
+  const config = (compteur) => ({
+    checks: [
+      { id: "compteur", run: compteur, paths: ["src/**"] },
+      { id: "autre", run: "node -e 0", paths: ["autre/**"] },
+      { id: "sans-chemin", run: "node -e 0" },
+    ],
+  });
+  const r = lancer(
+    {
+      ".drwil/ia-first.json": JSON.stringify(config(joue("a"))),
+      ".gitignore": "compteur.log\n",
+      "src/a.txt": "a\n",
+      "autre/b.txt": "b\n",
+      "hors.txt": "h\n",
+    },
+    { valider: true },
+  );
+  const { racine } = r;
+  assert.equal(compte(racine), 1);
+  assert.doesNotMatch(r.stdout, /repris/, "première passe : rien à reprendre");
+  const premiere = consigne(racine);
+  assert.match(premiere.checks.compteur.control, /^[0-9a-f]{64}$/);
+  assert.equal(premiere.checks["sans-chemin"].control, null, "sans paths : pas d'empreinte propre");
+  assert.ok(premiere.played.includes("compteur") && premiere.played.includes("sans-chemin"));
+
+  // Rien n'a changé, sauf un fichier hors de tout paths : repris, dit, et sans l'empreinte de l'arbre entier (invariant de QUA-141).
+  writeFileSync(join(racine, "hors.txt"), "autre chose\n");
+  const deuxieme = passe(racine);
+  assert.equal(deuxieme.status, 0, deuxieme.stdout + deuxieme.stderr);
+  assert.equal(compte(racine), 1, "le contrôle n'a pas rejoué");
+  assert.match(deuxieme.detail, /^\[ia-first\] node -e "require.* a : repris \(fichiers du contrôle inchangés, run-checks du \d{4}-/m);
+  assert.match(deuxieme.detail, /^\[ia-first\] node -e 0…$/m);
+  assert.match(deuxieme.stdout, /— 2 repris \(fichiers du contrôle inchangés\), \d+ rejoué\(s\) — /);
+  const reprise = consigne(racine);
+  assert.equal(reprise.checks.compteur.ranAt, premiere.checks.compteur.ranAt, "le verdict repris garde sa date");
+  assert.equal(reprise.checks.compteur.control, premiere.checks.compteur.control);
+  assert.deepEqual(
+    reprise.played.filter((id) => ["compteur", "autre", "sans-chemin"].includes(id)),
+    ["sans-chemin"],
+    "seul un contrôle joué dans la passe entre dans l'empreinte de l'arbre",
+  );
+
+  // Un octet d'un fichier du paths, la déclaration : rejoué ; l'autre contrôle reste repris.
+  writeFileSync(join(racine, "src/a.txt"), "b\n");
+  assert.match(passe(racine).stdout, /— 1 repris/);
+  assert.equal(compte(racine), 2);
+  writeFileSync(join(racine, ".drwil/ia-first.json"), JSON.stringify(config(joue("autre-declaration"))));
+  passe(racine);
+  assert.equal(compte(racine), 3, "déclaration changée : rejoué");
+
+  // « Tout rejouer », CI, hook : tout rejoué.
+  for (const [args, env] of [
+    [["--tout-rejouer"], {}],
+    [["--replay-all"], {}],
+    [[], { CI: "1" }],
+  ]) {
+    const avant = compte(racine);
+    const p = passe(racine, { args, env });
+    assert.equal(compte(racine), avant + 1, `${args.join(" ")} ${JSON.stringify(env)} : rejoué`);
+    assert.doesNotMatch(p.stdout, /repris/);
+  }
+  // Un hook choisit ses contrôles sur les fichiers indexés : il ne reprend jamais rien.
+  assert.doesNotMatch(passe(racine, { env: { DRWIL_HOOK: "pre-commit" } }).stdout, /repris/);
+});
+
+test("QUA-141 : un contrat ajouté (son contrôle déclaré dans .drwil/ia-first.json) ne rejoue plus les autres contrôles ; un réglage changé les rejoue", () => {
+  const compteur = {
+    id: "compteur",
+    run: `node -e "require('fs').appendFileSync('compteur.log','x')"`,
+    paths: [".drwil/ia-first.json", "src/**"],
+  };
+  const config = (autres = [], lang = "fr") => JSON.stringify({ lang, checks: [compteur, ...autres] }, null, 2);
+  const { racine } = lancer({ ".drwil/ia-first.json": config(), ".gitignore": "compteur.log\n", "src/a.txt": "a\n" }, { valider: true });
+  assert.equal(compte(racine), 1);
+  writeFileSync(join(racine, ".drwil/ia-first.json"), config([{ id: "tests-nouveau", run: "node -e 0", paths: ["src/**"] }]));
+  const ajoute = passe(racine);
+  assert.equal(ajoute.status, 0, ajoute.stdout + ajoute.stderr);
+  assert.equal(compte(racine), 1, "le contrôle déjà vert n'est pas rejoué");
+  assert.match(ajoute.detail, /: repris \(fichiers du contrôle inchangés, run-checks du \d{4}-/);
+  writeFileSync(join(racine, ".drwil/ia-first.json"), config([{ id: "tests-nouveau", run: "node -e 0", paths: ["src/**"] }], "en"));
+  passe(racine);
+  assert.equal(compte(racine), 2, "un réglage qu'il lit a changé : rejoué");
+});
+
+test('QUA-141 : un contrôle en échec, sans paths, ou déclaré reuse: false ou reuse: "tree" est rejoué à chaque passe', () => {
+  const joue = (sortie) => `node -e "require('fs').appendFileSync('compteur.log','x');process.exit(${sortie})"`;
+  const r = lancer(
+    {
+      ".drwil/ia-first.json": JSON.stringify({
+        checks: [
+          { id: "rouge", run: joue(1), paths: ["src/**"] },
+          { id: "reseau", run: joue(0), paths: ["src/**"], reuse: false },
+          { id: "arbre", run: joue(0), paths: ["src/**"], reuse: "tree" },
+          { id: "vide", run: joue(0), paths: ["rien/**"] },
+        ],
+      }),
+      ".gitignore": "compteur.log\n",
+      "src/a.txt": "a\n",
+    },
+    { valider: true },
+  );
+  assert.equal(r.status, 1, "le contrôle rouge échoue");
+  assert.equal(compte(r.racine), 4);
+  const p = passe(r.racine);
+  assert.equal(compte(r.racine), 8, "tous rejoués");
+  assert.equal(p.status, 1);
+  assert.doesNotMatch(p.stdout, /repris/);
+  const v = consigne(r.racine);
+  assert.deepEqual(
+    Object.entries(v.checks)
+      .filter(([id]) => ["rouge", "reseau", "arbre", "vide"].includes(id))
+      .map(([id, c]) => [id, c.control === null]),
+    [
+      ["rouge", false],
+      ["reseau", true],
+      ["arbre", true],
+      ["vide", true],
+    ],
+    "reuse: false, reuse: \"tree\" et paths sans fichier n'ont pas d'empreinte propre ; un échec en a une mais n'est jamais repris",
+  );
+});
+
+test("QUA-141 : un contrôle dont les fichiers changent pendant la passe ne laisse pas d'empreinte propre", () => {
+  const r = lancer(
+    {
+      ".drwil/ia-first.json": JSON.stringify({
+        checks: [{ id: "ecrit", run: "node -e \"require('fs').writeFileSync('src/intrus.txt','x')\"", paths: ["src/**"] }],
+      }),
+      "src/a.txt": "a\n",
+    },
+    { valider: true },
+  );
+  assert.ok(!existsSync(join(r.racine, VERDICTS)), "rien n'est consigné : le contrôle a modifié ce qu'il juge");
+});
+
+test("QUA-141 : en anglais, la reprise se dit en anglais", () => {
+  const racine = lancer(
+    {
+      ".drwil/ia-first.json": JSON.stringify({ lang: "en", checks: [{ id: "un", run: "node -e 0", paths: ["src/**"] }] }),
+      "src/a.txt": "a\n",
+    },
+    { valider: true },
+  ).racine;
+  const p = passe(racine);
+  assert.match(p.detail, /^\[ia-first\] node -e 0 : reused \(check files unchanged, run-checks of \d{4}-/m);
+  assert.match(p.stdout, /1 reused \(check files unchanged\), \d+ replayed/);
+});
+
+test("QUA-141 : un arbre changé hors des fichiers du contrôle garde son empreinte propre sans empreinte d'arbre ; un fichier de verdicts sans contrôles se lit", () => {
+  const fichiers = {
+    ".drwil/ia-first.json": JSON.stringify({
+      checks: [{ id: "ecrit", run: "node -e \"require('fs').writeFileSync('autre.txt','x')\"", paths: ["src/**"] }],
+    }),
+    "src/a.txt": "a\n",
+    [VERDICTS]: "{}",
+  };
+  const r = lancer(fichiers, { valider: true });
+  const verdicts = consigne(r.racine);
+  assert.equal(verdicts.fingerprint, null);
+  assert.deepEqual(verdicts.played, []);
+  assert.match(verdicts.checks.ecrit.control, /^[0-9a-f]{64}$/);
+});
+
+test("QUA-250 : en CI, une PR qui le demande reprend les verdicts restaurés de la CI de la branche principale ; sans demande ni verdict, tout est rejoué", () => {
+  const joue = (nom) => `node -e "require('fs').appendFileSync('compteur.log','x')" ${nom}`;
+  const fichiers = {
+    ".drwil/ia-first.json": JSON.stringify({
+      checks: [
+        { id: "code", run: joue("code"), paths: ["src/**"] },
+        { id: "doc", run: joue("doc"), paths: ["docs/**"] },
+        { id: "rouge", run: `${joue("rouge")} && node -e "process.exit(1)"`, paths: ["src/**"] },
+      ],
+    }),
+    ".gitignore": "compteur.log\n",
+    "src/a.txt": "a\n",
+    "docs/b.md": "b\n",
+  };
+  const ci = { CI: "true" };
+  const pr = { CI: "true", DRWIL_CI_REUSE: "1" };
+  // Push sur la branche principale : CI sans demande, tout joué, verdicts écrits (ceux que la CI met en cache).
+  const principale = lancer(fichiers, { valider: true, env: ci });
+  assert.equal(compte(principale.racine), 3);
+  assert.doesNotMatch(principale.stdout, /repris/);
+  const ecrits = readFileSync(join(principale.racine, VERDICTS), "utf8");
+  assert.equal(JSON.parse(ecrits).checks.code.status, "ok");
+  // Un nouveau push sur la branche principale rejoue tout, même avec des verdicts présents.
+  passe(principale.racine, { env: ci });
+  assert.equal(compte(principale.racine), 6, "la branche principale ne reprend jamais");
+
+  // PR de documentation, autre copie de travail (autre chemin) : verdicts restaurés, comme par le cache.
+  const branche = lancer({ ...fichiers, "docs/b.md": "modifié\n", [VERDICTS]: ecrits }, { valider: true, env: pr });
+  assert.equal(compte(branche.racine), 2, "seuls la doc modifiée et le contrôle en échec sont rejoués");
+  assert.match(branche.detail, /^\[ia-first\] node -e "require.* code : repris \(fichiers du contrôle inchangés, run-checks du \d{4}-/m);
+  assert.match(branche.detail, /^\[ia-first\] node -e "require.* doc : rejoué$/m);
+  assert.match(branche.stdout, /— 1 repris \(fichiers du contrôle inchangés\), \d+ rejoué\(s\)/);
+
+  // Sans demande (CI seule), sans verdict restauré (premier passage, cache expiré), ou avec « tout rejouer » : tout est rejoué.
+  for (const [nom, extra, env, args] of [
+    ["CI sans demande", { [VERDICTS]: ecrits }, ci, []],
+    ["aucun verdict restauré", {}, pr, []],
+    ["verdicts illisibles", { [VERDICTS]: "pas du JSON" }, pr, []],
+    ["tout rejouer", { [VERDICTS]: ecrits }, pr, ["--tout-rejouer"]],
+  ]) {
+    const { racine } = lancer({ ...fichiers, ...extra }, { valider: true, env: { CI: "" } });
+    rmSync(join(racine, "compteur.log"));
+    if (VERDICTS in extra) writeFileSync(join(racine, VERDICTS), extra[VERDICTS]);
+    else rmSync(join(racine, VERDICTS), { force: true });
+    const p = passe(racine, { env, args });
+    assert.equal(compte(racine), 3, `${nom} : tout rejoué`);
+    assert.doesNotMatch(p.stdout, /repris/, nom);
+  }
+});
+
+const PREPUSH = ".drwil/evidence/pre-push-verdicts.json";
+const valide = (racine) => {
+  git(racine, "add", "-A");
+  git(racine, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "y");
+};
+
+test("QUA-152 : au pre-push, un contrôle « ok » aux fichiers inchangés est repris (verdicts de run-checks ou du pre-push), le dit, et ne touche pas aux verdicts de run-checks", () => {
+  const joue = (nom) => `node -e "require('fs').appendFileSync('compteur.log','x')" ${nom}`;
+  const { racine } = lancer(
+    {
+      ".drwil/ia-first.json": JSON.stringify({ checks: [{ id: "compteur", run: joue("a"), paths: ["src/**"] }] }),
+      ".gitignore": "compteur.log\n.drwil/evidence/\n",
+      "src/a.txt": "a\n",
+      "doc.md": "d\n",
+    },
+    { valider: true },
+  );
+  const push = { env: { DRWIL_PUSH_REFS: "refs/heads/travail" } };
+  const verdictsRunChecks = readFileSync(join(racine, VERDICTS), "utf8");
+  assert.equal(compte(racine), 1);
+
+  // Commit de documentation seule : repris depuis run-checks, dit.
+  writeFileSync(join(racine, "doc.md"), "autre\n");
+  valide(racine);
+  const reprise = passe(racine, push);
+  assert.equal(reprise.status, 0, reprise.stdout + reprise.stderr);
+  assert.equal(compte(racine), 1, "repris, pas rejoué");
+  assert.match(reprise.detail, /^\[ia-first\] node -e "require.* a : repris \(fichiers du contrôle inchangés, run-checks du \d{4}-/m);
+  assert.match(reprise.stdout, /\d+ repris \(fichiers du contrôle inchangés\)/);
+  assert.equal(readFileSync(join(racine, VERDICTS), "utf8"), verdictsRunChecks, "un pre-push n'écrit pas les verdicts de run-checks");
+  assert.match(JSON.parse(readFileSync(join(racine, PREPUSH), "utf8")).checks.compteur.control, /^[0-9a-f]{64}$/);
+
+  // Code modifié : rejoué, puis repris au pre-push suivant sur le verdict du pre-push (run-checks n'a plus l'empreinte).
+  writeFileSync(join(racine, "src/a.txt"), "b\n");
+  valide(racine);
+  assert.doesNotMatch(passe(racine, push).stdout, /compteur.*repris/);
+  assert.equal(compte(racine), 2, "fichier du paths modifié : rejoué");
+  writeFileSync(join(racine, "doc.md"), "encore\n");
+  valide(racine);
+  const seconde = passe(racine, push);
+  assert.equal(compte(racine), 2);
+  assert.match(seconde.detail, /a : repris \(fichiers du contrôle inchangés, pre-push du \d{4}-/);
+  assert.equal(readFileSync(join(racine, VERDICTS), "utf8"), verdictsRunChecks);
+
+  // Arbre sale, autre référence poussée, CI, « tout rejouer » : tout rejoué.
+  const cas = [
+    ["arbre sale", () => writeFileSync(join(racine, "intrus.txt"), "x\n"), push],
+    ["autre référence", () => {}, { env: { DRWIL_PUSH_REFS: "refs/heads/autre" } }],
+    ["deux références", () => {}, { env: { DRWIL_PUSH_REFS: "refs/heads/travail refs/heads/autre" } }],
+    ["CI", () => {}, { env: { DRWIL_PUSH_REFS: "refs/heads/travail", CI: "1" } }],
+    ["tout rejouer", () => {}, { ...push, args: ["--tout-rejouer"] }],
+  ];
+  for (const [nom, prepare, options] of cas) {
+    prepare();
+    const avant = compte(racine);
+    const p = passe(racine, options);
+    assert.equal(compte(racine), avant + 1, `${nom} : rejoué`);
+    assert.doesNotMatch(p.stdout, /repris/, nom);
+    rmSync(join(racine, "intrus.txt"), { force: true });
+    writeFileSync(join(racine, "doc.md"), `${nom}\n`);
+    valide(racine);
+  }
+});
+
+test('QUA-152 : au pre-push, un contrôle en échec, sans paths, reuse: false ou reuse: "tree" est rejoué', () => {
+  const joue = (sortie) => `node -e "require('fs').appendFileSync('compteur.log','x');process.exit(${sortie})"`;
+  const { racine } = lancer(
+    {
+      ".drwil/ia-first.json": JSON.stringify({
+        checks: [
+          { id: "rouge", run: joue(1), paths: ["src/**"] },
+          { id: "reseau", run: joue(0), paths: ["src/**"], reuse: false },
+          { id: "arbre", run: joue(0), paths: ["src/**"], reuse: "tree" },
+          { id: "sans-chemin", run: joue(0) },
+          {
+            id: "ecrit",
+            run: "node -e \"if (!process.env.DRWIL_PUSH_REFS) process.exit(1); require('fs').writeFileSync('src/intrus.txt','x')\"",
+            paths: ["src/**"],
+          },
+        ],
+      }),
+      ".gitignore": "compteur.log\n.drwil/evidence/\n",
+      "src/a.txt": "a\n",
+    },
+    { valider: true },
+  );
+  const avant = compte(racine);
+  const p = passe(racine, { env: { DRWIL_PUSH_REFS: "refs/heads/travail" } });
+  assert.equal(compte(racine), avant * 2, "tous rejoués");
+  assert.equal(p.status, 1);
+  assert.doesNotMatch(p.stdout, /repris/);
+  assert.deepEqual(
+    Object.keys(JSON.parse(readFileSync(join(racine, PREPUSH), "utf8")).checks).filter((id) => id === "rouge" || id === "ecrit"),
+    [],
+    "ni un échec, ni un contrôle dont les fichiers ont changé pendant la passe, ne sont consignés",
+  );
+});
+
+test("QUA-152 : au pre-push, des verdicts qui ne s'écrivent pas ne changent pas le verdict de la passe", () => {
+  const { racine } = lancer(
+    {
+      ".drwil/ia-first.json": JSON.stringify({ checks: [{ id: "vert", run: "node -e 0", paths: ["src/**"] }] }),
+      ".drwil/evidence": "fichier",
+      "src/a.txt": "a\n",
+    },
+    { valider: true },
+  );
+  const p = passe(racine, { env: { DRWIL_PUSH_REFS: "refs/heads/travail" } });
+  assert.equal(p.status, 0, p.stdout + p.stderr);
+});
+
+test("QUA-208 : de bout en bout, un contrôle réservé par runAt est non exécuté au commit et au push (sans bloquer), joué et bloquant hors hook et en CI", () => {
+  const config = JSON.stringify({ checks: [{ id: "lent", name: "lent", run: "node -e 'process.exit(1)'", runAt: ["verify", "ci"] }] });
+  const fichiers = { ".drwil/ia-first.json": config, "src/a.js": "x" };
+  const commit = lancer(fichiers, { indexer: ["src/a.js"], env: { DRWIL_HOOK: "pre-commit" } });
+  assert.equal(commit.status, 0, commit.stdout);
+  assert.match(commit.detail, /^\[ia-first\] ⚠ non exécuté : lent \(réservé par runAt \(verify, ci\) : pas joué au commit/m);
+  const push = lancer(fichiers, { valider: true, env: { DRWIL_PUSH_REFS: "refs/heads/travail" } });
+  assert.equal(push.status, 0, push.stdout);
+  assert.match(push.detail, /^\[ia-first\] ⚠ non exécuté : lent \(réservé par runAt : pas joué au push/m);
+  for (const [cas, env] of [
+    ["hors hook (verify)", {}],
+    ["CI", { CI: "true" }],
+  ]) {
+    const r = lancer(fichiers, { valider: true, env });
+    assert.equal(r.status, 1, `${cas} : l'échec du contrôle réservé bloque`);
+    assert.match(r.stdout, /✗ échec : lent/, cas);
+  }
+});
+
+test("QUA-208 : un contrôle confié à la CI et découpé (shards) reste « confié à la CI » en local, jamais joué ni compté passé", () => {
+  const config = JSON.stringify({
+    ciFiles: [".github/workflows/ia-first.yml"],
+    checks: [{ id: "lent", name: "lent", run: "node -e 'process.exit(1)' $DRWIL_SHARD_INDEX", runAt: ["ci"], shards: 2 }],
+  });
+  const fichiers = { ".drwil/ia-first.json": config, "src/a.js": "x", ".githooks/check-control-coverage.mjs": "process.exit(0);\n" };
+  const r = lancer(fichiers, { valider: true });
+  assert.equal(r.status, 0, r.stdout);
+  assert.match(r.stdout, /— confié à la CI, non exécuté ici : lent/);
+  assert.doesNotMatch(r.detail, /\[ia-first\] lent : durée : \d+ ms/);
+});
+
+test("QUA-208 : de bout en bout, un contrôle confié à la CI est annoncé « confié à la CI » au commit, au push et hors hook (sans bloquer), joué et bloquant en CI", () => {
+  const config = JSON.stringify({
+    ciFiles: [".github/workflows/ia-first.yml"],
+    checks: [{ id: "lent", name: "lent", run: "node -e 'process.exit(1)'", runAt: ["ci"] }],
+  });
+  // La CI déclarée active la couverture CI de chaque contrôle : un bouchon, ce test éprouve l'adaptateur.
+  const fichiers = { ".drwil/ia-first.json": config, "src/a.js": "x", ".githooks/check-control-coverage.mjs": "process.exit(0);\n" };
+  for (const [cas, options] of [
+    ["commit", { indexer: ["src/a.js"], env: { DRWIL_HOOK: "pre-commit" } }],
+    ["push", { valider: true, env: { DRWIL_PUSH_REFS: "refs/heads/travail" } }],
+    ["hors hook (verify)", { valider: true }],
+  ]) {
+    const r = lancer(fichiers, options);
+    assert.equal(r.status, 0, `${cas} : ${r.stdout}`);
+    assert.match(r.stdout, /— confié à la CI, non exécuté ici : lent/, `${cas} : le résumé, seule ligne d'une passe verte, le dit`);
+    assert.match(
+      r.detail,
+      /^\[ia-first\] ⚠ non exécuté : lent \(confié à la CI \(runAt \["ci"\]\) : pas joué ici, jamais compté passé/m,
+      cas,
+    );
+    assert.doesNotMatch(r.detail, /\[ia-first\] lent : durée : \d+ ms/, `${cas} : jamais lancé`);
+  }
+  const ci = lancer(fichiers, { valider: true, env: { CI: "true" } });
+  assert.equal(ci.status, 1, "en CI, l'échec du contrôle confié à la CI bloque");
+  assert.match(ci.stdout, /✗ échec : lent/);
+  assert.doesNotMatch(ci.stdout, /confié à la CI/);
+  // Sans CI déclarée, le réglage est refusé : un échec qui nomme la raison.
+  const sansCi = lancer({ ...fichiers, ".drwil/ia-first.json": config.replace('".github/workflows/ia-first.yml"', "") }, { valider: true });
+  assert.equal(sansCi.status, 1);
+  assert.match(sansCi.stdout, /lent : réglage runAt refusé \(runAt \["ci"\] sans CI déclarée \(ciFiles vide\)/);
+});
+
+test("QUA-261 : run-checks --with-ci-checks joue aussi les contrôles confiés à la CI et le dit ; sans l'option, leur verdict n'est jamais repris", () => {
+  const vert = JSON.stringify({
+    lang: "fr",
+    ciFiles: [".github/workflows/ia-first.yml"],
+    checks: [{ id: "lent", name: "lent", run: "node -e 0", runAt: ["ci"], paths: ["src/**"] }],
+  });
+  const { racine, ...premiere } = lancer(
+    { ".drwil/ia-first.json": vert, "src/a.js": "x", ".githooks/check-control-coverage.mjs": "process.exit(0);\n" },
+    { valider: true },
+  );
+  assert.equal(premiere.status, 0, premiere.stdout);
+  const avec = passe(racine, { args: ["--with-ci-checks"] });
+  assert.equal(avec.status, 0, avec.stdout);
+  assert.match(avec.stdout, /— option --with-ci-checks active : contrôles confiés à la CI joués en local \(lent\)/);
+  assert.doesNotMatch(avec.stdout, /confié à la CI, non exécuté/);
+  assert.match(avec.detail, /^\[ia-first\] lent : durée : \d+ ms/m, "joué pour de bon");
+  // Le verdict « ok » laissé par l'option n'est pas repris par une passe sans elle : le contrôle reste confié à la CI.
+  const sans = passe(racine);
+  assert.match(sans.stdout, /— confié à la CI, non exécuté ici : lent/);
+  assert.doesNotMatch(sans.detail, /lent : repris/);
+  // L'échec d'un contrôle confié à la CI se reproduit en local par l'option.
+  writeFileSync(join(racine, ".drwil/ia-first.json"), vert.replace("node -e 0", "node -e 'process.exit(1)'"));
+  const rouge = passe(racine, { args: ["--with-ci-checks"] });
+  assert.equal(rouge.status, 1);
+  assert.match(rouge.stdout, /✗ échec : lent/);
+  // Aucun contrôle confié à la CI : l'option le dit aussi ; en anglais, l'attente de la CI comme l'option.
+  writeFileSync(join(racine, ".drwil/ia-first.json"), JSON.stringify({ checks: [{ id: "x", run: "node -e 0" }] }));
+  assert.match(passe(racine, { args: ["--with-ci-checks"] }).stdout, /— option --with-ci-checks active : aucun contrôle confié à la CI/);
+  writeFileSync(join(racine, ".drwil/ia-first.json"), JSON.stringify({ lang: "en", checks: [{ id: "x", run: "node -e 0" }] }));
+  assert.match(passe(racine, { args: ["--with-ci-checks"] }).stdout, /— option --with-ci-checks active: no check left to CI/);
+  writeFileSync(join(racine, ".drwil/ia-first.json"), vert.replace('"lang":"fr"', '"lang":"en"'));
+  assert.match(passe(racine).stdout, /— left to CI, not run here: lent/);
+  assert.match(
+    passe(racine, { args: ["--with-ci-checks"] }).stdout,
+    /— option --with-ci-checks active: checks left to CI played locally \(lent\)/,
+  );
+});
+
+test("QUA-208 : dans ce dépôt, les contrôles lents sont confiés à la CI, acceptés par le moteur et joués par la CI du dépôt ; les tests des contrats restent en local", async () => {
+  const { runAtVerdict } = await import("./engine-runat.mjs");
+  const depot = dirname(dirname(SCRIPT));
+  const config = JSON.parse(readFileSync(join(depot, ".drwil/ia-first.json"), "utf8"));
+  const confies = config.checks.filter((c) => Array.isArray(c.runAt) && c.runAt.every((v) => v === "ci")).map((c) => c.id);
+  for (const id of ["couverture-tests", "couverture-hooks", "couverture-claude", "tarball", "couverture-diff"])
+    assert.ok(confies.includes(id), `${id} confié à la CI`);
+  for (const c of config.checks.filter((k) => "runAt" in k)) {
+    for (const contexte of ["commit", "push", "verify"])
+      assert.equal(runAtVerdict(c, c.id, contexte, { ciFiles: config.ciFiles })?.status, "not-run", `${c.id} non joué : ${contexte}`);
+    assert.equal(runAtVerdict(c, c.id, "ci", { ciFiles: config.ciFiles }), null, `${c.id} joué en CI`);
+  }
+  const contrats = config.checks.filter((c) => /^tests-qua-\d+$/.test(c.id));
+  assert.ok(contrats.length > 100, "les tests des contrats sont déclarés");
+  assert.deepEqual(
+    contrats.filter((c) => "runAt" in c).map((c) => c.id),
+    [],
+    "les tests rapides des contrats restent en local",
+  );
+  assert.deepEqual(config.ciFiles, [".github/workflows/ia-first.yml"]);
+  const flux = readFileSync(join(depot, ".github/workflows/ia-first.yml"), "utf8");
+  assert.match(
+    flux,
+    /^ {6}- if: steps\.prouve\.outputs\.saute != 'true'\n {8}run: node \.githooks\/run-checks\.mjs --aggregate-shards \.drwil\/evidence\/shards$/m,
+    "la CI du dépôt joue run-checks (variable CI posée par la forge)",
+  );
+  assert.doesNotMatch(flux, /^\s+CI:/m, "la variable CI n'est jamais écrasée");
+});
+
+test("dans ce dépôt, couverture-claude compile le paquet avant ses tests et ses paths couvrent ce que ses tests lisent", async () => {
+  // Couverture des tests (QUA-004) : sans compilation propre, couverture-claude dépendait de couverture-tests ; repris
+  // d'un verdict précédent sur une PR hors packages/, celui-ci ne compilait plus et dist/ manquait.
+  const { globToRegex } = await import("./glob.mjs");
+  const depot = dirname(dirname(SCRIPT));
+  const script = JSON.parse(readFileSync(join(depot, "package.json"), "utf8")).scripts["test:claude:coverage"];
+  assert.match(script, /^tsc --build && /, "le paquet est compilé avant les tests");
+  const config = JSON.parse(readFileSync(join(depot, ".drwil/ia-first.json"), "utf8"));
+  const controle = config.checks.find((c) => c.id === "couverture-claude");
+  assert.equal(controle.run, "npm run test:claude:coverage");
+  const couvert = (f) => controle.paths.some((g) => globToRegex(g).test(f));
+  const tests = script.match(/packages\/drwil\/test\/[\w-]+\.test\.mjs/g);
+  assert.equal(tests.length, 5);
+  for (const f of [...tests, "packages/drwil/src/index.ts", "tsconfig.json", "packages/drwil/tsconfig.json"])
+    assert.ok(couvert(f), `${f} rejoue couverture-claude`);
+});
+
+// QUA-325 : commit et push du kit posés par `init` (reconnus par le manifeste, QUA-238) : contrôles du projet à `paths` différés.
+const empreinteKit = (texte) => createHash("sha256").update(texte).digest("hex");
+const ZERO = "0".repeat(40);
+const KIT_CFG = JSON.stringify({
+  checks: [
+    { id: "lent", name: "lent", run: 'node -e "process.exit(1)"', paths: ["**"] },
+    { id: "rapide", name: "rapide", run: "node -e 0" },
+  ],
+});
+const identite = ["-c", "user.name=t", "-c", "user.email=t@t"];
+const tete = (racine) => spawnSync("git", ["rev-parse", "HEAD"], { cwd: racine, encoding: "utf8" }).stdout.trim();
+/** Projet commité (bouchons des contrôles de base, un contrôle « lent » en échec qui déclare `paths: ["**"]`). */
+function projetKit() {
+  const racine = tmp();
+  const fichiers = {
+    ".githooks/check-docs.mjs": "process.exit(0);\n",
+    ".githooks/check-contract-tests.mjs": "process.exit(0);\n",
+    ".githooks/check-architecture.mjs": "process.exit(0);\n",
+    ".drwil/ia-first.json": KIT_CFG,
+    "src/a.js": "x\n",
+  };
+  for (const [chemin, contenu] of Object.entries(fichiers)) {
+    mkdirSync(dirname(join(racine, chemin)), { recursive: true });
+    writeFileSync(join(racine, chemin), contenu);
+  }
+  git(racine, "init", "-q", "-b", "travail");
+  git(racine, "add", "-A");
+  git(racine, ...identite, "commit", "-qm", "projet");
+  return racine;
+}
+/** Un fichier du kit et son manifeste, indexés ; `commit` : commités avec le trailer de `init`. */
+function poserKit(racine, n, { commit = false, manifeste = true } = {}) {
+  const chemin = `.githooks/kit-${n}.mjs`;
+  writeFileSync(join(racine, chemin), `// kit ${n}\n`);
+  const fichier = join(racine, ".drwil/installed-files.json");
+  const avant = existsSync(fichier) ? JSON.parse(readFileSync(fichier, "utf8")) : {};
+  if (manifeste) writeFileSync(fichier, JSON.stringify({ ...avant, [chemin]: empreinteKit(`// kit ${n}\n`) }));
+  git(racine, "add", "-A");
+  if (commit) git(racine, ...identite, "commit", "-qm", `kit ${n}`, "-m", "Drwil-Kit-Update: 9.9.9");
+}
+const auCommit = (racine, env = {}) => passe(racine, { env: { DRWIL_HOOK: "pre-commit", ...env } });
+const auPush = (racine, commits, env = {}) =>
+  passe(racine, { env: { DRWIL_PUSH_REFS: " refs/heads/travail", DRWIL_PUSH_COMMITS: commits, ...env } });
+const DIFFERE = /^\[ia-first\] ⚠ non exécuté : lent \(commit du kit, reconnu par son manifeste/m;
+
+test("QUA-325 : au commit posé par init dont le manifeste explique tout, un contrôle du projet à paths est différé ; les autres jouent", () => {
+  const racine = projetKit();
+  poserKit(racine, 1);
+  const r = auCommit(racine, { DRWIL_KIT_UPDATE: "9.9.9" });
+  assert.equal(r.status, 0, r.stdout + r.detail);
+  assert.match(r.detail, DIFFERE);
+  assert.match(r.detail, /^\[ia-first\] rapide…$/m, "un contrôle sans paths joue");
+  assert.doesNotMatch(r.detail, /^\[ia-first\] lent…$/m);
+});
+
+test("QUA-325 : sans la variable, avec un fichier hors manifeste ou un fichier du kit édité à la main, le contrôle à paths joue et bloque (QUA-019)", () => {
+  const racine = projetKit();
+  poserKit(racine, 1);
+  const sansVariable = auCommit(racine);
+  assert.equal(sansVariable.status, 1, "la variable seule ne diffère rien, son absence non plus");
+  assert.match(sansVariable.stdout, /✗ échec : lent/);
+  writeFileSync(join(racine, "src/a.js"), "y\n");
+  git(racine, "add", "src/a.js");
+  const horsKit = auCommit(racine, { DRWIL_KIT_UPDATE: "9.9.9" });
+  assert.equal(horsKit.status, 1, "un fichier du projet dans le commit : contrôles joués comme avant");
+  assert.doesNotMatch(horsKit.detail, DIFFERE);
+  git(racine, "checkout", "HEAD", "--", "src/a.js");
+  writeFileSync(join(racine, ".githooks/kit-1.mjs"), "// édité à la main\n");
+  git(racine, "add", "-A");
+  const edite = auCommit(racine, { DRWIL_KIT_UPDATE: "9.9.9" });
+  assert.equal(edite.status, 1, "empreinte différente du manifeste : jugé");
+  const sansManifeste = projetKit();
+  poserKit(sansManifeste, 1, { manifeste: false });
+  assert.equal(auCommit(sansManifeste, { DRWIL_KIT_UPDATE: "9.9.9" }).status, 1, "aucun manifeste : rien n'est expliqué");
+});
+
+test("QUA-325 : au pre-push d'une suite de commits du kit, le contrôle à paths est différé ; un commit hors kit, une branche neuve au commit hors kit ou la CI le jouent", () => {
+  const racine = projetKit();
+  const base = tete(racine);
+  poserKit(racine, 1, { commit: true });
+  poserKit(racine, 2, { commit: true });
+  const kit = auPush(racine, `${tete(racine)}:${base}`);
+  assert.equal(kit.status, 0, kit.stdout + kit.detail);
+  assert.match(kit.detail, DIFFERE);
+  assert.match(kit.detail, /rejoué en CI\)/);
+  assert.equal(auPush(racine, "").status, 1, "sans les commits poussés : joué comme avant");
+  assert.equal(auPush(racine, `${tete(racine)}:${ZERO}`).status, 1, "branche neuve : le commit du projet est poussé aussi");
+  assert.equal(auPush(racine, `${tete(racine)}:${base}`, { CI: "true" }).status, 1, "la CI rejoue tout");
+  assert.equal(auPush(racine, `--all:${base}`).status, 1, "commits illisibles : joué");
+  writeFileSync(join(racine, "src/a.js"), "y\n");
+  git(racine, "add", "-A");
+  git(racine, ...identite, "commit", "-qm", "faux kit", "-m", "Drwil-Kit-Update: 9.9.9");
+  const faux = auPush(racine, `${tete(racine)}:${base}`);
+  assert.equal(faux.status, 1, "trailer sur un commit qui touche du code projet : joué (QUA-019)");
+  assert.doesNotMatch(faux.detail, DIFFERE);
+});
+
+test("QUA-325 : le pre-push transmet à run-checks les commits poussés (SHA local et distant de chaque branche, ni tag ni suppression)", () => {
+  const racine = tmp();
+  mkdirSync(join(racine, ".githooks"));
+  writeFileSync(join(racine, ".githooks/pre-push"), readFileSync(join(dirname(SCRIPT), "pre-push")));
+  const sortie = join(racine, "env.json");
+  writeFileSync(
+    join(racine, ".githooks/run-checks.mjs"),
+    `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(sortie)}, JSON.stringify(process.env));\n`,
+  );
+  const lignes = [
+    `refs/heads/a ${"1".repeat(40)} refs/heads/a ${"2".repeat(40)}`,
+    `refs/tags/v1 ${"3".repeat(40)} refs/tags/v1 ${ZERO}`,
+    `(delete) ${ZERO} refs/heads/vieux ${"4".repeat(40)}`,
+    `refs/heads/b ${"5".repeat(40)} refs/heads/b ${ZERO}`,
+  ];
+  const r = spawnSync("sh", [join(racine, ".githooks/pre-push"), "origin", "url"], { input: `${lignes.join("\n")}\n`, encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr);
+  const vu = JSON.parse(readFileSync(sortie, "utf8"));
+  assert.equal(vu.DRWIL_PUSH_COMMITS.trim(), `${"1".repeat(40)}:${"2".repeat(40)} ${"5".repeat(40)}:${ZERO}`);
+  assert.equal(vu.DRWIL_PUSH_REFS.trim(), "refs/heads/a refs/heads/b");
+});
+
+test("QUA-325 : en anglais, un contrôle sans nom est nommé par sa commande ; commit poussé sans trailer ou SHA inconnu : joué", () => {
+  const racine = projetKit();
+  const cfg = { lang: "en", checks: [{ run: 'node -e "process.exit(1)"', paths: ["**"] }] };
+  writeFileSync(join(racine, ".drwil/ia-first.json"), JSON.stringify(cfg));
+  git(racine, "add", "-A");
+  git(racine, ...identite, "commit", "-qm", "config");
+  const base = tete(racine);
+  poserKit(racine, 1, { commit: true });
+  const kit = auPush(racine, `${tete(racine)}:${base}`);
+  assert.equal(kit.status, 0, kit.stdout + kit.detail);
+  assert.match(kit.detail, /not run: node -e "process\.exit\(1\)" \(kit commit, recognised by its manifest: replayed in CI\)/);
+  assert.equal(auPush(racine, `${"a".repeat(40)}:${base}`).status, 1, "SHA inconnu : joué");
+  writeFileSync(join(racine, ".githooks/kit-1.mjs"), "// kit 1\n// autre\n");
+  git(racine, "add", "-A");
+  git(racine, ...identite, "commit", "-qm", "sans trailer");
+  assert.equal(auPush(racine, `${tete(racine)}:${base}`).status, 1, "commit sans trailer : joué");
+});
+
+test("QUA-327 : pendant un lot, la conduite livrée ne lance que le commit puis, après un échec, le contrôle en échec ou verify --failed ; la passe complète reste avant VERIFY et à la clôture", () => {
+  // Gabarit livré et copies du dépôt : les deux disent la même conduite.
+  const racine = fileURLToPath(new URL("..", import.meta.url));
+  const gabarit = "packages/drwil/templates/common/";
+  const plat = (f) => readFileSync(join(racine, f), "utf8").replace(/\s+/g, " ");
+  for (const [base, claude] of [
+    [`${gabarit}base/`, `${gabarit}tools/claude/`],
+    ["", ""],
+  ]) {
+    if (base) {
+      assert.match(
+        plat(`${base}AGENTS.md`),
+        /During a lot, no full pass: the commit is the check \(its hook runs the checks its staged files touch\); after a failure, the failing check alone or `npx drwil verify --failed`; the full pass is before VERIFY and at the closing/,
+      );
+    } else {
+      assert.match(
+        plat("AGENTS.md"),
+        /Pendant un lot, pas de passe complète : le commit fait foi .* après un échec, le contrôle en échec seul ou `npx drwil verify --failed` ; la passe complète, avant VERIFY et à la clôture/,
+      );
+    }
+    const regles = plat(`${base}docs/ia-first/8-conduct-rules.md`);
+    const regle = regles.slice(regles.indexOf("**During a lot, a targeted pass**"), regles.indexOf("**Long commands**"));
+    assert.match(regle, /neither `run-checks` in full nor `drwil verify --agent` is run, and the `drwil-checks` subagent is not called/);
+    assert.match(regle, /its hook picks the checks whose `paths` match the staged files, those of the brief's contracts included/);
+    assert.match(regle, /the tool judges, never a list chosen by the agent/);
+    assert.match(regle, /the failing check alone .* or `npx drwil verify --failed`/);
+    assert.match(regle, /The full pass stays required before VERIFY and at the closing, and the CI stays complete/);
+    const skill = plat(`${claude}.claude/skills/start-a-workstream/SKILL.md`);
+    assert.match(skill, /During a lot, no full pass and no `drwil-checks` subagent: the commit is the check/);
+    assert.match(skill, /the full pass is the closing's \(before VERIFY and at the closing; the CI stays complete\)/);
+    assert.match(
+      plat(`${claude}.claude/agents/drwil-checks.md`),
+      /You are called for the full pass: before VERIFY and at the closing\. During a lot, the main session does not call you/,
+    );
+    assert.match(
+      plat(`${base}docs/recipes/working-with-branches.md`),
+      /During a lot, no full pass: the commit is the check; after a failure, the failing check alone or `npx drwil verify --failed`/,
+    );
+  }
+});

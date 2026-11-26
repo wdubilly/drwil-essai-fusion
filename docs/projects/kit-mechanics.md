@@ -1,0 +1,260 @@
+# Projet : mécanique du kit IA-first (fichiers propres au kit)
+
+**Statut** : référence — mécanique livrée à l'installation du kit, le 2026-10-04.
+
+<!-- scope
+files:
+  - .githooks/run-checks.mjs
+  - .githooks/check-docs.mjs
+  - .githooks/skill-headers.mjs
+  - .githooks/doc-coherence.mjs
+  - .githooks/check-contract-tests.mjs
+  - .githooks/contract-tests.mjs
+  - .githooks/contract-tests-reporters.mjs
+  - .githooks/check-architecture.mjs
+  - .githooks/consumption.mjs
+  - .githooks/consumption.test.mjs
+  - .githooks/check-architecture.test.mjs
+  - .githooks/check-control-coverage.mjs
+  - .githooks/glob.mjs
+  - .githooks/format-staged.mjs
+  - .githooks/format-staged.test.mjs
+  - .githooks/engine.mjs
+  - .githooks/fingerprints.mjs
+  - .githooks/contracts.mjs
+  - .githooks/glossary.mjs
+  - .githooks/glossary.test.mjs
+  - .githooks/contracts.test.mjs
+  - .githooks/risk.mjs
+  - .githooks/risk.test.mjs
+  - .githooks/scope.mjs
+  - .githooks/scope.test.mjs
+  - .githooks/state.mjs
+  - .githooks/state-cli.mjs
+  - .githooks/state-lots.mjs
+  - .githooks/state-draft.mjs
+  - .githooks/state-limits.mjs
+  - .githooks/state-cli-lots.mjs
+  - .githooks/briefs-lots.mjs
+  - .githooks/state-lots.test.mjs
+  - .githooks/state-resume.test.mjs
+  - .githooks/state-cli-process.test.mjs
+  - .githooks/briefs.mjs
+  - .githooks/pr-watch.mjs
+  - .githooks/pr-watch-main.mjs
+  - .githooks/merge-auto.mjs
+  - .githooks/merge-auto-forge.mjs
+  - .githooks/wait-command.mjs
+  - .githooks/wait-command.test.mjs
+  - outils/parite-des-outils.test.mjs
+  - .githooks/base-checks.mjs
+  - .githooks/base-checks.test.mjs
+  - .githooks/pr-watch.test.mjs
+  - .githooks/merge-auto.test.mjs
+  - .githooks/merge-auto-forge.test.mjs
+  - .githooks/state-texts.mjs
+  - .githooks/state.test.mjs
+  - .githooks/close.mjs
+  - .githooks/close-mechanics.mjs
+  - .githooks/close-done.mjs
+  - .githooks/close-journal.mjs
+  - .githooks/close-branches.mjs
+  - .githooks/close-limits.mjs
+  - .githooks/closure-proof.mjs
+  - .githooks/close.test.mjs
+  - .githooks/close-branches.test.mjs
+  - .githooks/close-limits.test.mjs
+  - .githooks/worktree.mjs
+  - .githooks/worktree.test.mjs
+  - .githooks/note.mjs
+  - .githooks/note.test.mjs
+  - .githooks/detour.mjs
+  - .githooks/detour.test.mjs
+  - .githooks/detour-resume.test.mjs
+  - .githooks/scope-gate.mjs
+  - .githooks/scope-gate.test.mjs
+  - .githooks/check-code-rules.test.mjs
+  - .githooks/check-control-coverage.test.mjs
+  - .githooks/check-docs.test.mjs
+  - .githooks/doc-coherence.test.mjs
+  - .githooks/skill-headers.test.mjs
+  - .githooks/check-contract-tests.test.mjs
+  - .githooks/contract-tests.test.mjs
+  - .githooks/check-file-size.test.mjs
+  - .githooks/check-kit-size.test.mjs
+  - .githooks/check-diff-coverage.test.mjs
+  - .githooks/create-release.test.mjs
+  - .githooks/acceptance-sheet.test.mjs
+  - .githooks/release-verdict.test.mjs
+  - .githooks/promote-release.test.mjs
+  - .githooks/recette-note.test.mjs
+  - .githooks/glob.test.mjs
+  - .githooks/engine.test.mjs
+  - .githooks/run-checks.test.mjs
+  - .githooks/engine-shards.test.mjs
+  - .githooks/run-checks-shards.test.mjs
+  - .githooks/run-checks-pr.test.mjs
+  - .githooks/dashboard.test.mjs
+  - .githooks/state-evidence.mjs
+  - .githooks/state-transitions.mjs
+  - .githooks/state-validate.mjs
+  - .githooks/state-history.mjs
+  - .githooks/state-messages.mjs
+  - .githooks/state-messages-en.mjs
+  - .githooks/state-messages-fr.mjs
+  - .githooks/state-context-texts.mjs
+  - .githooks/state-reopen.mjs
+  - .githooks/state-resume.mjs
+  - .githooks/state-cli-commands.mjs
+  - .githooks/state-acceptance.mjs
+  - .githooks/state-polls.mjs
+  - .githooks/state-hooks.mjs
+  - .githooks/engine-branch.mjs
+  - .githooks/engine-launch.mjs
+  - .githooks/engine-pass.mjs
+  - .githooks/engine-runat.mjs
+  - .githooks/engine-selftest.mjs
+  - .githooks/engine-shards.mjs
+  - .githooks/engine-texts.mjs
+  - .githooks/run-checks-kit.mjs
+  - .githooks/run-checks-pr.mjs
+  - .githooks/run-checks-shards.mjs
+  - .githooks/run-checks-texts.mjs
+  - .githooks/run-checks-verdicts.mjs
+  - .githooks/detour-rules.mjs
+  - .githooks/detour-texts.mjs
+  - .githooks/detour-resume.mjs
+  - .githooks/briefs-criteria.mjs
+  - .githooks/briefs-intents.mjs
+  - .githooks/briefs-overlap.mjs
+  - .githooks/briefs-order.mjs
+  - .githooks/check-docs-texts.mjs
+  - .githooks/check-docs-workstreams.mjs
+  - .githooks/check-docs-paths.mjs
+  - .githooks/close-checks.mjs
+  - .githooks/close-texts.mjs
+  - .githooks/consumption-format.mjs
+  - .githooks/consumption-log.mjs
+  - .githooks/consumption-texts.mjs
+  - .githooks/consumption-split.mjs
+  - .githooks/worktree-texts.mjs
+  - .githooks/doc-coherence-fixes.mjs
+  - .githooks/doc-coherence-texts.mjs
+  - .githooks/scope-gate-kit.mjs
+  - .githooks/scope-gate-merge.mjs
+  - .githooks/scope-gate-texts.mjs
+  - .githooks/scope-derived.mjs
+  - .githooks/contracts-validate.mjs
+  - .githooks/check-control-coverage-jobs.mjs
+  - .githooks/glossary-labels.mjs
+  - .githooks/acceptance-sheet-texts.mjs
+  - .githooks/acceptance-sheet-works.mjs
+  - .githooks/create-release-texts.mjs
+  - .githooks/create-release-version.mjs
+  - .githooks/dashboard-read.mjs
+  - .githooks/dashboard-texts.mjs
+  - .githooks/recette-note-texts.mjs
+  - .githooks/prepare-commit-msg
+  - .githooks/pre-commit
+  - .githooks/pre-push
+  - .githooks/commit-msg
+  - .githooks/check-file-size.mjs
+  - .githooks/check-file-size.legacy.json
+  - .githooks/check-kit-size.mjs
+  - .githooks/check-diff-coverage.mjs
+  - .githooks/check-code-rules.mjs
+  - .githooks/check-colors.mjs
+  - .githooks/check-contrast.mjs
+  - .githooks/dashboard.mjs
+  - .githooks/create-release.mjs
+  - .githooks/release-review.mjs
+  - .githooks/release-review.test.mjs
+  - .githooks/acceptance-sheet.mjs
+  - .githooks/release-verdict.mjs
+  - .githooks/release-verdict-poll.mjs
+  - .githooks/promote-release.mjs
+  - .githooks/recette-note.mjs
+  - .github/workflows/ia-first.yml
+  - .claude/settings.json
+-->
+
+## 1. Besoin
+
+Le contrôle au commit (`.githooks/check-docs.mjs`) signale tout fichier de
+code indexé qu'aucune fiche de `docs/projects/` ne couvre (rappel de
+cadrage, sévérité réglable par `.drwil/ia-first.json` -> `cadrage` :
+`bloquant` par défaut, `avertissement` en option). Sans cette fiche, les
+fichiers posés par le kit lui-même seraient signalés dès le tout premier
+commit du projet (bloquant si le réglage `bloquant` est choisi).
+
+## 2. Hors périmètre
+
+Le code applicatif du projet : chaque chantier porte son propre bloc
+`cadrage` dans sa fiche, et une petite tâche se rattache à
+`docs/projects/routine-maintenance.md`.
+
+## 3. Hooks d'assistants sans `node` dans le PATH
+
+Les commandes de hook livrées testent `node` avant de l'appeler et disent quoi faire (règle et codes de sortie :
+QUA-215 et QUA-216 ; ne pas les recopier ici). Claude Code (`.claude/settings.json`) et Copilot
+(`packages/drwil/templates/common/tools/copilot/.github/hooks/drwil.json`, champs `bash` et `powershell`) portent le test dans la commande. Gemini n'a qu'un champ
+`command` lu par deux langages : hors Windows, `init` écrit des commandes qui passent par le lanceur
+`.gemini/hooks/drwil-node.sh` (copie du gabarit, choix de la forme dans `packages/drwil/src/render-gemini.ts`) ; sous
+Windows la commande reste `node` seul. Côté visiteur : `INSTALL.md` (QUA-218).
+
+## 4. Cache de verdicts de la CI GitHub
+
+Une PR restaure les verdicts de la branche principale (QUA-250) et dit au journal quel commit le cache restauré
+porte et son retard sur la base (QUA-297). La fusion sauvegarde ce cache même quand son push est sauté sur arbre
+prouvé : les verdicts voyagent avec la preuve d'arbre de la PR (QUA-296). Dans le workflow du dépôt tout se passe dans
+le job `checks` (artefact `arbre-prouve`) ; dans celui du gabarit, le job `plan` compare les arbres et passe les
+verdicts à `checks` (artefacts `proven-tree` et `proven-verdicts`). Règles et preuves : ces contrats, non recopiés ici.
+
+## 5. Consommation lue dans les journaux des outils
+
+`.githooks/consumption.mjs` lit les journaux de session de Claude Code (un dossier par projet) et ceux de Copilot CLI
+(un dossier pour tous les projets : seuls les appels faits dans le projet comptent, et un journal qui ne cite jamais
+le chemin du projet n'est pas analysé). Les clés d'appel sont préfixées par l'outil : un chantier mené avec les deux
+additionne ses parts sans rien compter deux fois. Formats relevés : la recette de consommation ; règles : QUA-042 et
+QUA-304, non recopiées ici.
+
+## 6. Empreinte par contrôle, chemins générés et formatage
+
+`.githooks/fingerprints.mjs` ne prend de `.drwil/ia-first.json`, pour l'empreinte d'un contrôle, que sa propre
+déclaration et les réglages hors `checks` : un contrat ajouté ne rejoue plus les autres contrôles. Un contrôle qui lit
+les déclarations des autres porte `readsChecks: true` et garde le fichier entier ; la preuve de clôture garde
+l'empreinte de l'arbre entier. Son marqueur `FINGERPRINT_SCHEME`, comparé par la mise à jour, fait annoncer la
+première passe complète ; `drwil doctor` signale un kit antérieur (`staleFingerprints`, `packages/drwil/src/doctor-checks.ts`). `kitPaths` (`.githooks/scope-gate-kit.mjs`) calcule les chemins des contrôles que le kit
+génère (paire de couverture, `e2e`) au lieu de `["**"]` ; la CLI l'importe, si bien que la mise à jour, `doctor --fix`
+et la barrière de périmètre calculent les mêmes chemins. `.githooks/format-staged.mjs`, lancé par
+`.githooks/pre-commit` avant les contrôles, juge le formatage des fichiers indexés quand la clé `format` est déclarée,
+sans rien réécrire. Propres au dépôt : `outils/recette-adoptant.mjs` rejoue une mise à jour réelle sur des copies
+d'adoptants, `outils/verifier-recette-reelle.mjs` rappelle, sans bloquer, une fiche d'installation sans recette réelle
+au lot 1. Règles : QUA-141, QUA-087, QUA-238, QUA-303, QUA-328 à QUA-331, non recopiées ici.
+
+## Reprise
+
+- Sondage d'attestation Claude Code : `drwil attest-poll` prépare le jugement ;
+  `.claude/hooks/prompt-hook.mjs` et `.claude/hooks/attest-poll.mjs` lisent seuls
+  la réponse de l'outil (QUA-235). Les préparations locales sont dans
+  le sous-dossier local attest-polls de `.drwil/evidence/`, hors git ; les attestations restent versionnées.
+- Sous Copilot CLI, `--tool copilot` rend le même sondage dans la forme réelle d'`ask_user` et
+  `.claude/hooks/copilot-polls.mjs` en ramène les événements natifs au socle de Claude Code, comme les quatre autres
+  sondages préparés (préparation passée par ce module en tube).
+- Les modes portables `--tool gemini|codex` passent par cette même entrée ;
+  les garanties et limites restent dans QUA-235 (frontière du sondage préparé).
+  Codex seul reçoit les scripts partagés, sans réglages ni agents Claude.
+  Cursor seul reçoit aussi les scripts partagés ; `--tool cursor` prépare son format,
+  mais seule l'interface humaine dédiée `drwil cursor-acp` lit le choix et réutilise le moteur.
+  Ce client supplémentaire n'est pas le chat habituel Cursor ni un hook natif inventé.
+  Les cinq canaux ont des tests fictifs seulement : voir la matrice, section « Human attestation parity ».
+
+- **Dernier état** : fiche posée à l'installation, rien à reprendre. Si le
+  kit ajoute un nouveau fichier de mécanique (`.githooks/` ou un réglage
+  d'outil IA), l'ajouter ici. Lot 4 a ajouté `.githooks/check-control-coverage.mjs`
+  (QUA-013), `.githooks/pre-push`, `.githooks/commit-msg` (livré désactivé)
+  et `.githooks/scope.test.mjs`. Lot 5 a ajouté `.githooks/check-file-size.mjs`
+  et son fichier de plafonds hérités `.githooks/check-file-size.legacy.json`,
+  ainsi que le point d'extension vide `.githooks/check-code-rules.mjs` — les
+  trois livrés mais **opt-in** (pas lancés tant que le projet ne les déclare
+  pas dans `.drwil/ia-first.json → checks`).

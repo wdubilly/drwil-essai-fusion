@@ -1,0 +1,74 @@
+# Intention : Packager drwil sur npm
+
+**Statut** (2026-10-04) : en attente — questions à trancher non encore tranchées par le demandeur (voir `docs/projects/suites-kit-portable.md`, point 7). Audit du paquet fait le 2026-10-04 (voir « Constat vérifié » ci-dessous) : le paquet ne fonctionne pas en l'état, bloquant confirmé en conditions réelles.
+
+**Revu le 2026-10-16** : le constat du 2026-10-04 est dépassé. Le paquet
+fonctionne (champ `files`, construction avant empaquetage, test du
+tarball installé comme un utilisateur : contrôle `tarball`), une release
+v0.5.1 existe (GitHub, 2026-10-13) et les questions 3 à 5 sont réglées
+par les faits. Restent la publication sur npm elle-même : questions 1 et 6
+(public ou privé, registre), vague 7 de l'index.
+
+## Besoin
+Rendre drwil facilement distribuable pour un usage en équipe et/ou hors environnement local, afin de pouvoir l'initialiser avec `npx drwil init` sans dépendre d'un chemin absolu.
+
+## Existant
+- Monorepo `drwil/` avec `packages/drwil/` fonctionnel (CLI, templates, bin)
+- Build TypeScript fonctionne (`tsc --build`)
+- Templates complets (AGENTS.md, .githooks, docs IA-first)
+- Modes `minimal/full`, config `.drwil/ia-first.json`, CLI `init/apply`
+
+## Questions à trancher
+1. Scope de publication : privé (npm private org) ou public ?
+2. ~~Nom du package~~ : tranché — `drwil`, voir
+   `docs/projects/journal.md` (2026-10-10, fiches condensées).
+3. Version initiale : 0.1.0 ou 1.0.0 ?
+4. Inclure `dist/` et `templates/` dans le paquet (files field) ?
+5. Automatiser build avant publish (prepublishOnly) ?
+6. Registry : npmjs.com ou registre interne (GitLab, Verdaccio...) ?
+
+## Périmètre
+- Configurer `package.json` (files, main/types, bin, engines, license, repository)
+- Ajouter scripts (prepublishOnly/build/clean)
+- Vérifier que `templates/` et `bin/` sont inclus dans le tarball
+- Générer premier build propre
+- Publier en dry-run (`npm publish --dry-run`)
+- Documenter usage (`npx drwil init`)
+- Mettre à jour README/DOC_TECHNICO_COMMERCIAL si nécessaire
+
+## Hors périmètre
+- CI/CD de publication automatique (GitHub Actions/GitLab) pour l'instant
+- Changement de logique du kit (fonctionnel tel quel)
+
+## Contraintes / risques
+- `templates/` doivent être présents dans `dist` ou copiés ? Actuellement lus depuis `../templates` relatif à `dist`/`bin` → vérifier chemin dans build
+- Bin ESM (`type: module`) OK
+- Taille paquet raisonnable
+
+## Constat vérifié (2026-10-04)
+Simulation réelle : `npm pack` puis extraction dans un dossier propre, `npm
+install`, exécution de `node bin/drwil.js`.
+
+- **🔴 Bloquant — le paquet ne fonctionne pas** : sans champ `files`, `npm
+  pack` respecte `.gitignore`, qui exclut `dist/`. Preuve : après
+  installation du tarball, `node bin/drwil.js` échoue avec
+  `Cannot find module '.../dist/index.js'`. Le paquet inclut en revanche
+  `packages/drwil/src/` et `packages/drwil/test/kit.test.mjs`
+  (28 Ko), inutiles une fois publié.
+- **🟡 Nécessaire avant publication** : `README.md` à la racine du paquet
+  (absent — c'est la page affichée sur npm), `LICENSE` (absent de tout le
+  dépôt), champs `package.json` manquants (`license`, `repository`,
+  `description`, `engines`).
+- **🔵 Geste humain** : authentification npm — vérifié, ce poste n'est pas
+  connecté (`npm whoami` → `ENEEDAUTH`). La publication elle-même reste un
+  geste humain, jamais fait par un agent sans accord explicite.
+
+## Décisions à prendre
+- Publier en 0.1.0 (beta)
+- Inclure `dist/`, `templates/`, `bin/` via `files: ["dist", "templates", "bin", "README.md"]`
+- `prepublishOnly`: `pnpm build`
+
+## Critères de sortie
+- `npm publish --dry-run` OK (contenu attendu)
+- Peut être initialisé depuis dossier vierge avec `npx drwil init --mode full`
+- Documentation usage mise à jour

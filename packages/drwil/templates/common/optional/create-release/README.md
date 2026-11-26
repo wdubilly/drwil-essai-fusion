@@ -1,0 +1,136 @@
+# Create a release (optional)
+
+Module **not installed by default**: `scaffold()` does not copy this
+folder. Posts an **annotated Git tag** (`vX.Y.Z`) and a **GitHub release
+note** (`gh release create --notes-file`: the acceptance note « without verdict » is its body) on the current commit — never
+a modified tracked file (no committed `CHANGELOG.md`, no `package.json`
+bump): compatible with QUA-017 (no direct commit on the main branch)
+without an extra PR.
+
+## Contents
+
+- `create-release.mjs`: computes the next version from the latest final tag
+  and the non-merge commits since that tag (Conventional Commits, best effort
+  — no message format is imposed, safe default: *patch* bump if no `feat`
+  or breaking type is recognised), then posts the tag and the release.
+  `--dry-run` mode: prints the computed version without creating anything.
+  `--candidate`: publishes a candidate pre-release instead (`vX.Y.Z-rc.N`),
+  see « Acceptance before publication » below. Its messages and its version
+  logic are in `create-release-texts.mjs` and `create-release-version.mjs`.
+- `acceptance-sheet.mjs`: generates the acceptance sheet of a candidate
+  (imported by `create-release.mjs --candidate`, never written by hand); its
+  messages are in `acceptance-sheet-texts.mjs`, its workstreams and points in
+  `acceptance-sheet-works.mjs`.
+- `release-verdict.mjs`: records the acceptance verdict on a candidate — a
+  **human** gesture (interactive terminal, the candidate's name typed back);
+  an agent never runs it.
+- `release-verdict-poll.mjs`: prepares, with the same checks and writing
+  nothing, the same verdict as a `drwil-verdict` chat poll; only the
+  human's answer, read by the Claude Code hook, records it.
+- `promote-release.mjs`: promotes an approved candidate to the final release.
+- `recette-note.mjs`: writes the acceptance note of a version into the
+  repository through a dedicated branch and a PR (a candidate's promotion, or
+  the catch-up of a note); in `solo` mode a direct release carries its « no
+  verdict » note in the release body instead. Its messages are in
+  `recette-note-texts.mjs`.
+- `release-review.mjs`: review of `README.md`, `docs/features.md` and
+  `docs/architecture.md` before any tag, preview included (imported by
+  `create-release.mjs`): for each one, what changed since the latest tag
+  (closed workstreams, code files touched, document modified or not); a
+  document not modified must be recorded « unchanged » with its reason, one
+  line of `docs/release-review.md` (`- vX.Y.Z — `README.md` — unchanged:
+  <reason>`), and a document still carrying skeleton text blocks the
+  release. The agent updates the documents in the version PR, before the
+  tag.
+
+## Acceptance before publication (candidate, verdict, promotion)
+
+For a project whose versions are validated by an acceptance team that does
+not read the repository:
+
+1. `node .githooks/create-release.mjs --candidate` publishes a GitHub
+   **pre-release** `vX.Y.Z-rc.N` with the tarball and a generated
+   acceptance sheet (Markdown, attached and shown as the release note), from
+   the latest final tag to the candidate. On top, **to validate**: each
+   point says what to look at and how — human acceptance criteria of the
+   workstreams (each brief read in its last version before its deletion),
+   known limits from the journal (« not tried for real yet » when the limit
+   says so; a sentence of need or decision never becomes a point),
+   attestations to redo — with a stable ID (`vX.Y.Z-P<n>`) and the link to
+   its workstream's PR (found through the `Drwil-Brief` trailer of the
+   commits). Below, the **non-regression** already proven: `drwil verify`
+   verdict (not counting the rule against direct work on the main branch,
+   where a release is always created, and saying so), contracts proven by a
+   test (IDs and titles), OS tested by the CI on the commit (a job whose
+   test steps were skipped does not count), tarball
+   fingerprint (sha256). `--candidate
+   --dry-run` prints the sheet without building or publishing anything.
+2. The acceptance team gives its verdict (human command):
+   `node .githooks/release-verdict.mjs vX.Y.Z-rc.N --approve`, or
+   `--reserve <point>` / `--refuse <point>` for each point concerned
+   (`--note <text>` optional). The verdict keeps who gave it (GitHub
+   identity) and when, and is recorded on the pre-release (asset
+   `recette-verdict.json`, summary added to its note) — never in a commit.
+   Each reserve and each refusal becomes a GitHub issue, sorted afterwards
+   as a defect to fix or an intent (recipe « fix a defect »).
+   From the chat (Claude Code): the agent prepares the same verdict with
+   `node .githooks/release-verdict-poll.mjs vX.Y.Z-rc.N <same options>` and
+   asks the printed poll as is; only the human's answer records it.
+3. `node .githooks/promote-release.mjs vX.Y.Z-rc.N` (`--dry-run` to
+   preview) refuses a candidate without a verdict or refused; approved, with
+   or without reserves, it tags the same commit `vX.Y.Z` and publishes the
+   final release with the same tarball (fingerprint checked against the
+   sheet), the reserves listed in its note. It becomes `releases/latest`,
+   which never shows a pre-release: a README can link there once and for
+   all, with no commit at each version.
+
+## Required OS: green CI before the release (optional)
+
+Absent by default, never added by an update of the kit:
+`release.requiredOs` in `.drwil/ia-first.json`, a list of runner labels
+(e.g. `["ubuntu-latest", "windows-latest", "macos-latest"]`), for a
+project whose CI does not test every OS at each pull request. Once set,
+`create-release.mjs` (direct release or `--candidate`) and
+`promote-release.mjs` refuse, without creating anything, as long as one of
+those OS has no successful CI job that really ran its test steps on the
+commit concerned (`HEAD`, or the candidate's commit) — read through `gh`,
+like the acceptance sheet; a job whose test steps were skipped never
+counts, in the sheet either. The refusal names the missing OS and the
+command to run the workflow by hand; `gh` unavailable is a refusal too;
+`--dry-run` says it without refusing. Order: run the workflow on the
+commit (`gh workflow run <workflow file> --ref <branch>`, a
+`workflow_dispatch` trigger testing every required OS), wait for every
+required OS to be green, then create the release.
+
+## npm tarball attached to the release (downloadable)
+
+If the repository holds one or more publishable npm packages (a
+`package.json`, if present, tracked by Git, with a `name`, without
+`"private": true` — a monorepo with `workspaces` and a private root is no
+problem: only non-private packages are picked up), the script builds a
+tarball (`npm pack`) for each and attaches it as an asset of the GitHub
+release. Anyone visiting the release page can then download the `.tgz`
+directly, without cloning the repository or publishing to the npm
+registry. `--dry-run` lists the packages that would be packed without
+building or attaching anything.
+
+## Manual activation (on explicit request, like a commit or a push)
+
+Like any commit or push, this script must never run on its own: it is
+started only when the user explicitly asks (e.g. "make a release", "tag a
+version"), not automatically at each merge.
+
+1. Copy **all** the module's `.mjs` files (each script comes with the
+   files it imports: `create-release-texts.mjs`, `create-release-version.mjs`,
+   `acceptance-sheet-texts.mjs`, `acceptance-sheet-works.mjs`,
+   `recette-note-texts.mjs`…) into the project's `.githooks/`.
+2. Preview without creating anything: `node .githooks/create-release.mjs --dry-run`.
+3. Actually create the tag and the release: `node .githooks/create-release.mjs`
+   (needs `git push` to `origin` and an authenticated `gh` for the release
+   note — the tag is created even if `gh` fails). The « no verdict » note is
+   the body of the release, never a branch or a PR; `--dry-run` shows it.
+
+Accepted limit: designed for GitHub (`gh release create`). On GitLab, the
+Git tag is posted the same way (`git tag` + `git push`), but the release
+note has to be created through GitLab's Releases API (not covered here —
+to adapt, best effort as for `alert-if-ci-broken`).

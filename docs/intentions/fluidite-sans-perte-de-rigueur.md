@@ -1,0 +1,114 @@
+# Intention : fluidité sans perte de rigueur — solliciter l'humain juste
+
+**Statut** (2026-10-12) : en partie réalisée — leviers 1 (lancer en un
+geste, clôture sur évidence de verify), 2 (décision lue par un hook, via
+`/drwil-lancer`) et 7 (rappel de l'état) faits le 2026-10-10, voir
+`docs/projects/journal.md` ; restent les questions 3 et 4, et l'affichage
+de qui décide chaque transition.
+Rangement du 2026-10-26 : deux notes reprises en fin de fichier ; le levier 3 (attestation groupée) touche `docs/projects/journal.md`.
+
+**Revu le 2026-10-16** : levier 3, « une PR par chantier » est devenu la
+pratique (fusion automatique choisie au lancement, `/drwil-start`) ;
+l'attestation groupée recoupe le chantier « Attestation sans friction
+inutile » (QUA-032, journal du 2026-10-16).
+Reste vivant : afficher qui décide chaque transition, et l'ordre des
+leviers restants (question 4).
+
+**Projet** : DRWIL — **Niveau de risque** : HIGH (touche aux transitions
+humaines de la gouvernance).
+
+## Besoin
+
+Le workflow obtenu le 2026-10-09 approche le développement fiable visé,
+mais il est lourd pour l'humain. Compté sur cette seule journée : environ
+12 transitions humaines (chacune dans un terminal, le préfixe `!` de
+Claude Code ne fournissant pas de terminal interactif), 8 PR fusionnées
+une à une, 5 attestations séparées, une quinzaine de questions au fil de
+l'eau, 4 échecs de CI ou de contrôle dus au même piège de doc.
+
+Constat : la rigueur tient à **quelques décisions humaines bien placées**,
+pas au nombre de gestes. Intention : garder les mêmes garanties (l'agent
+ne définit pas seul ce qui est acceptable ; triche détectable et refusée
+hors du poste) en sollicitant l'humain **moins souvent et au bon moment**.
+
+## Existant
+
+- Gouvernance livrée le 2026-10-09 (`docs/projects/journal.md`, entrée
+  « Gouvernance : machine d'état et double barrière ») : transitions par
+  `node .githooks/state.mjs move …`, humaines par défaut pour ouvrir une
+  attente, lancer la réalisation et clore (terminal interactif).
+- Réglages `transitions` et `barriere` de `.drwil/ia-first.json`.
+- `drwil attest` : une attestation par contrat, dans un terminal.
+- Claude Code : hook `SessionStart` déjà branché sur l'état ; les hooks de
+  saisie (`UserPromptSubmit`) ne sont pas utilisés.
+
+## Leviers identifiés
+
+1. **Deux gestes humains par chantier** : *lancer* (valider fiche et
+   cadrage, ce qui ouvre l'attente et autorise la réalisation en une fois)
+   et *fusionner la PR* (déjà la relecture humaine). La clôture devient
+   mécanique, sur l'évidence de `drwil verify` (PASS ou ATTESTED, sur
+   `HEAD`, arbre propre), puisque le dernier mot reste à la fusion.
+2. **Décider dans le chat sans pouvoir être simulé** : un hook de l'outil
+   déclenché par la saisie de l'humain (Claude Code : `UserPromptSubmit`,
+   par exemple sur `/drwil go`) enregistre la décision ; c'est l'outil qui
+   l'écrit, pas le modèle. Repli : le terminal, pour les autres outils.
+3. **Grouper** : une PR par session de travail plutôt qu'une par fiche ;
+   une seule commande pour attester tous les contrats en attente (liste
+   affichée, confirmation unique) ; questions groupées au démarrage d'un
+   lot, choix recommandés appliqués par défaut sauf objection.
+4. **Supprimer les sources de reprises** : citations de fichiers ignorés
+   (fait le 2026-10-10, `docs/projects/journal.md`) et la petite
+   correction sous barrière bloquante (réglée par le lancement en un
+   geste, `docs/projects/journal.md`, « Fiche close sans critères : entretien sous barrière »).
+5. **Relire vite** : voir `docs/intentions/vue-de-relecture.md`.
+6. **Mesurer** : le bench (`docs/intentions/bench-avec-sans-drwil.md`)
+   compte les sollicitations humaines par tâche, pour vérifier que la
+   fluidité progresse sans perte de qualité.
+7. **Rappeler sans dériver** (ajouté le 2026-10-10) : à chaque message,
+   un rappel court de l'état lu sur disque (activité, fiche, périmètre),
+   pour que l'agent ne dérive pas au fil d'une longue session ; moins de
+   tentatives interdites, donc moins de refus et de reprises. Fait : voir
+   `docs/projects/journal.md` (2026-10-10, rappel court de l'état).
+
+## Contraintes
+
+- Aucune transition qui ouvre des droits ne devient décidable par l'agent
+  seul.
+- Agnostique de l'agent : le levier 2 est un accélérateur propre à un
+  outil, jamais la seule voie.
+- Le réglage `transitions` (`humain` / `agent`) et la sévérité `barriere`
+  restent les points de réglage, sans nouveau mode caché.
+
+## Questions à trancher
+
+1. ~~**Levier 1**~~ — tranchée le 2026-10-10 (journal, « Fluidité, levier 1 »).
+   Texte d'origine : fusionner ATTENTE, DEMANDE et REALISATION en un seul
+   geste humain ? Rendre la clôture mécanique, la fusion de la PR tenant
+   lieu de décision humaine ? (le levier le plus rentable : il supprime à
+   lui seul la moitié des allers-retours au terminal)
+2. ~~**Levier 2**~~ — tranchée le 2026-10-10 (journal, « Fluidité, levier 1 »).
+   Texte d'origine : la décision par hook de saisie est-elle une garantie
+   suffisante pour remplacer le terminal dans Claude Code ?
+3. **Levier 3** : une PR par session, ou une par chantier ? Attestation
+   groupée : oui ou non ?
+4. **Ordre** : quels leviers en premier, et dans quelle fiche (révision de
+   la gouvernance, ou fiches séparées) ?
+
+## Reprises du rangement du 2026-10-26
+
+### afficher l'état de gouvernance en continu (ex-note du 2026-10-21)
+
+**Besoin** :
+
+- 2026-10-21 — Afficher l'état de gouvernance (SCOPING, BUILD, VERIFY, CLOSING) en continu dans le terminal pour suivre l'avancement. Pistes : réglage statusLine de Claude Code livré par le kit avec un script .githooks/state-line.mjs lisant .drwil/state.json ; même script réutilisable dans l'invite du shell ; vérifier si Copilot CLI offre l'équivalent.
+
+**Existant** :
+
+- Levier 7 ci-dessus (rappel court de l'état à chaque message) : fait.
+
+### des chantiers plus petits, une fiche par lot (ex-note du 2026-10-21)
+
+**Besoin** :
+
+- 2026-10-21 — Chantiers trop gros : « critères et preuves durables » a pris 2 h 45, 31 fichiers, 3 contrats créés et 2 étendus, car il touchait trois mécaniques liées (jugement des critères, clôture, CI) ; les deux précédents tenaient en 40 min. Piste : cadrer une fiche par lot (un lot = un chantier vérifiable seul) plutôt qu'une fiche à quatre lots, et le dire dans la recette de cadrage.

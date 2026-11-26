@@ -1,0 +1,9 @@
+# Zones sensibles : la gouvernance elle-même (hooks, réglages des outils d'agent, configuration,
+# CI, contrats, socle du gabarit). Bloquant : le ruleset exige la revue des code owners, que le
+# mainteneur peut donner parce que l'agent ouvre ses PR avec son propre compte.
+/.githooks/ @wdubilly
+/.claude/ @wdubilly
+/.drwil/ia-first.json @wdubilly
+/.github/ @wdubilly
+/docs/contracts.md @wdubilly
+/packages/drwil/templates/common/ @wdubilly

@@ -1,0 +1,86 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "name": "drwil-state",
+            "type": "command",
+            "command": "sh \"$GEMINI_PROJECT_DIR/.gemini/hooks/drwil-node.sh\" 1 \"$GEMINI_PROJECT_DIR/.githooks/state.mjs\" gemini-start",
+            "timeout": 10000
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "name": "drwil-serve-welcome",
+            "type": "command",
+            "command": "sh \"$GEMINI_PROJECT_DIR/.gemini/hooks/drwil-node.sh\" 1 \"$GEMINI_PROJECT_DIR/.claude/hooks/serve-welcome.mjs\"",
+            "timeout": 15000
+          }
+        ]
+      }
+    ],
+    "BeforeAgent": [
+      {
+        "hooks": [
+          {
+            "name": "drwil-reminder",
+            "type": "command",
+            "command": "sh \"$GEMINI_PROJECT_DIR/.gemini/hooks/drwil-node.sh\" 1 \"$GEMINI_PROJECT_DIR/.githooks/state.mjs\" gemini-message",
+            "timeout": 10000
+          }
+        ]
+      }
+    ],
+    "BeforeTool": [
+      {
+        "matcher": "write_file|replace",
+        "hooks": [
+          {
+            "name": "drwil-scope",
+            "type": "command",
+            "command": "sh \"$GEMINI_PROJECT_DIR/.gemini/hooks/drwil-node.sh\" 2 \"$GEMINI_PROJECT_DIR/.claude/hooks/scope-reminder.mjs\"",
+            "timeout": 10000
+          }
+        ]
+      },
+      {
+        "matcher": "^ask_user$",
+        "hooks": [
+          {
+            "name": "drwil-attest",
+            "type": "command",
+            "command": "sh \"$GEMINI_PROJECT_DIR/.gemini/hooks/drwil-node.sh\" 2 \"$GEMINI_PROJECT_DIR/.claude/hooks/prompt-hook.mjs\" gemini",
+            "timeout": 120000
+          }
+        ]
+      }
+    ],
+    "AfterTool": [
+      {
+        "matcher": "write_file|replace",
+        "hooks": [
+          {
+            "name": "drwil-scope-after",
+            "type": "command",
+            "command": "sh \"$GEMINI_PROJECT_DIR/.gemini/hooks/drwil-node.sh\" 1 \"$GEMINI_PROJECT_DIR/.claude/hooks/scope-reminder.mjs\"",
+            "timeout": 10000
+          }
+        ]
+      },
+      {
+        "matcher": "^ask_user$",
+        "hooks": [
+          {
+            "name": "drwil-attest-result",
+            "type": "command",
+            "command": "sh \"$GEMINI_PROJECT_DIR/.gemini/hooks/drwil-node.sh\" 1 \"$GEMINI_PROJECT_DIR/.claude/hooks/prompt-hook.mjs\" gemini",
+            "timeout": 120000
+          }
+        ]
+      }
+    ]
+  }
+}
