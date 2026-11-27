@@ -13,6 +13,7 @@ précis.
 
 <!-- scope
 files:
+  - docs/essai/f3.md
   - docs/recipes/working-with-branches.md
   - outils/miroirs.json
   - packages/drwil/src/evidence.ts

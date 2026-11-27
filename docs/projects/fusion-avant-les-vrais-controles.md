@@ -1,8 +1,8 @@
 # Projet : aucune fusion n'est permise avant un contrôle réellement exécuté et réussi
 
-**Statut** : cadré le 2026-11-26 — P1 se tranche après la reproduction du lot 1.
+**Statut** : cadré le 2026-11-26 ; P1 tranché le 2026-11-27, après la reproduction du lot 1.
 **Risque** : HIGH
-**Maturité** : à affiner
+**Maturité** : prêt
 
 <!-- scope
 files:
@@ -60,11 +60,13 @@ d'arbre prouvé à reprendre ; sa CI a duré environ 11 minutes (lien non vérif
 - Dans ce dépôt, aucune exécution ne rapporte un succès sous un nom exigé (`checks`, `kit-tests (<os>)`) pour un travail que seule une autre exécution doit faire — `QUA-121`
 - La CI GitHub livrée ne rapporte pas `checks` réussi quand ses contrôles sont sautés au profit de la PR — `QUA-263`
 - Un même commit de branche n'est toujours pas contrôlé deux fois, et une branche sans PR reste testée — `QUA-121`
-- Sur un vrai dépôt GitHub dont la règle exige ces noms, une PR au contrôle en échec reste non fusionnable avant, pendant et après sa CI, fusion automatique programmée comprise [humain] — contrat `Manuel` à créer par le chantier
+- Sur un vrai dépôt GitHub dont la règle exige ces noms, une PR au contrôle en échec reste non fusionnable avant, pendant et après sa CI, fusion automatique programmée comprise [humain] — contrat `Manuel` à créer par le chantier — `QUA-339`
 
 ## Contrats modifiés
 
-Aucun validé : QUA-121 et QUA-263 décrivent le mécanisme actuel ; leur nouveau texte dépend de P1 et sera validé avec lui.
+- `QUA-121` — le texte suit le mécanisme D : le nom rapporté dépend de l'évènement (validé par le demandeur le 2026-11-27)
+- `QUA-263` — le texte suit le mécanisme D dans la CI livrée (validé par le demandeur le 2026-11-27)
+- `.githooks/run-checks.test.mjs` — ses cas de structure du workflow suivent le mécanisme retenu à P1, sans retirer l'exigence qu'une branche sans PR reste testée ni que les noms exigés soient conservés (validé par le demandeur le 2026-11-27)
 
 ## 2. Hors périmètre
 
@@ -83,12 +85,13 @@ Aucun validé : QUA-121 et QUA-263 décrivent le mécanisme actuel ; leur nouvea
 ## 4. Décisions
 
 - 2026-11-26 : P0, en tête de la 0.11.3.
+- 2026-11-27 : P1, mécanisme D (nom selon l'évènement, options en fin de section 8).
+- 2026-11-27 : le premier critère ne vise pas les `kit-tests` Windows et macOS, réussis sans tester sur une PR par
+  conception (QUA-045) ; il vise le travail confié à une autre exécution du même commit.
 
 ## 5. Points à trancher
 
-- [décision] P1 : le mécanisme, après la reproduction. Pistes non essayées : l'exécution sautée rapporte sous un
-  autre nom ; le workflow ne contrôle plus les push de branche qui ont une PR sans émettre les noms exigés ; abandon
-  du saut, au prix d'un double passage.
+Aucun.
 
 ## 6. Increments
 
@@ -100,7 +103,159 @@ Aucun validé : QUA-121 et QUA-263 décrivent le mécanisme actuel ; leur nouvea
 
 ## 7. Reprise
 
-- **Dernier état** (2026-11-26) : cadré ; défaut observé une fois, contournement par un contrôle en échec non reproduit.
-- **En attendant** : avant de fusionner une PR de code, vérifier que le `checks` de l'exécution `pull_request` est
-  terminé et réussi ; ne pas programmer sa fusion automatique avant.
-- **Prochaine étape** : [humain] `/drwil-start`.
+- **Dernier état** (2026-11-27) : lots 1 et 2 faits. Mécanisme D dans les deux workflows, QUA-121 et QUA-263 réécrits,
+  QUA-339 (contrat `Manuel` du critère 4) créé, changelog écrit ; essai réel de D sur la CI du dépôt en section 9.
+  Le lien `QUA-339` est ajouté au critère 4 sans changer son texte (empreinte des critères identique, QUA-174).
+- **En attendant** la fusion du correctif : avant de fusionner une PR, de code ou de documentation, vérifier que le
+  `checks` de l'exécution `pull_request` est terminé et réussi ; ne pas programmer sa fusion automatique avant. De même
+  ensuite pour une branche créée avant le correctif, tant qu'elle n'a pas intégré `master` : son push rapporte encore
+  `checks`.
+- **Prochaine étape** : [IA] vérification et clôture ; [humain] lot 3, essai réel et attestation de QUA-339.
+- **Dépôt d'essai** : conservé pour le lot 3. `master` y porte le projet factice avec la protection classique de la CI
+  livrée ; la copie de drwil est sur `etat-depot`, désormais protégée par les quatre noms exigés (protection classique,
+  administrateurs inclus) ; le ruleset 28200085 reste désactivé. L'issue #4 reste ouverte, la PR #14 est fermée, les
+  branches d'essai sont gardées.
+
+## 8. Constat du lot 1 (reproduction)
+
+Dépôt d'essai public `wdubilly/drwil-essai-fusion`, heures UTC du 2026-11-27.
+
+**Montage** : copie de `master` (`a19a19f3`) en un seul commit (`5d78f2b`) ; ruleset 28200085 copié du ruleset
+24840343, seul écart `require_code_owner_review: false` (aussi dans `.github/ruleset-master.json` de la copie) ; fusion
+automatique permise. Contrôle ajouté `essai-echec` : il échoue si un fichier du dossier d’essai, propre à la copie, contient
+`ECHEC-TOUJOURS`, ou `ECHEC-SUR-PR` sur un run `pull_request`. Aucun workflow ne s'est enregistré après les premiers
+push ; Actions désactivé puis réactivé sur ce seul dépôt les a fait apparaître (cause inconnue). La PR #1, restée sans
+aucun contrôle et `BLOCKED`, a été fermée.
+
+### CI du dépôt : défaut reproduit
+
+**Observé, PR #3** (documentation seule, `ECHEC-TOUJOURS` ; push, puis PR ouverte à 00:17:09 ; fusion automatique non
+programmée ; run push 45915831859, run PR 45915839546) :
+
+- 00:17:16 : `checks` du push sauté (140234728433) ; 00:17:26 : les `kit-tests` exigés sont tous réussis.
+- 00:17:28 : `mergeStateStatus` vaut `UNSTABLE` ; une boucle d'observation lance alors `gh pr merge 3 --merge`,
+  **fusion demandée à la main, sans `--admin` ni `--auto`**.
+- 00:17:31 : **PR fusionnée** (commit `301c43dd`). Le relevé suivant montre le `checks` de la PR (140234799105) en
+  file, `started_at` 00:17:30.
+- 00:37:38 : ce `checks` finit en **échec** (« ECHEC VOLONTAIRE DE L ESSAI » ; deux contrôles en échec, `essai-echec`
+  et miroirs dépôt/gabarit, tous deux dus au fichier d'essai).
+- La CI de `master` sur la fusion (run 45915870861) échoue ; l'issue d'alerte #4 s'ouvre à 00:29:54.
+
+**Observé, PR #2** (même contenu, fusion automatique programmée à 00:07:10, une seconde après l'ouverture ; run push
+45914846239, run PR 45914852203) :
+
+- 00:07:16 : `checks` du push sauté (140231523787).
+- 00:07:35 : **`UNSTABLE`** (fusionnable), le `plan` de la PR en cours, son `checks` absent du relevé.
+- 00:07:37 : le `checks` de la PR (140231634850) apparaît en file ; 00:07:38 : `BLOCKED`, et GitHub désactive la
+  fusion automatique (`repository_rule_violation`, « Repository rule violations found »). PR non fusionnée.
+- Pendant, à 00:09:57 : fusion normale refusée (« the base branch policy prohibits the merge ») ; fusion automatique
+  réarmée à 00:10:00, PR `BLOCKED`.
+- 00:24:17 : `checks` en échec (`essai-echec`, miroirs, périmètre de l'attente sans trailer) ; ensuite PR `BLOCKED`,
+  non fusionnée, fusion automatique toujours armée.
+
+La base `5d78f2b` passe les mêmes contrôles (dernière étape des deux jobs en échec) : les échecs viennent des PR.
+
+**Déduit** :
+
+- Tant que le `checks` de la PR n'existe pas, celui, sauté, du push satisfait la règle. La fenêtre va du dernier autre
+  contrôle exigé réussi jusqu'à la création de ce `checks`.
+- PR #3 : GitHub aurait évalué la règle avant la création du `checks` de la PR, malgré un `started_at` antérieur d'une
+  seconde à la fusion.
+- PR #2 : la fusion automatique aurait été tentée dans la fenêtre et aurait abouti trop tard. **La fusion par la seule
+  fusion automatique n'est pas reproduite ici** ; sur la #481, elle a gagné la course (fusion à 21:19:07, `checks` de
+  la PR commencé à 21:19:22).
+- Une PR de code, dont les `kit-tests` Ubuntu testent réellement, dure sans doute assez pour fermer la fenêtre (non
+  essayé).
+
+**Observé ensuite sur la PR #2, après l'échec** : fusion normale refusée à 00:39:11 ; run push relancé à 00:39:13, qui
+crée un nouveau `checks` sauté (140241718802, 00:39:25), plus récent que l'échec ; la PR reste `BLOCKED`, fusion
+automatique armée, et la fusion normale est encore refusée à 00:39:53.
+
+### CI livrée : défaut reproduit
+
+**Montage** : l'ancien `master` d'essai renommé `etat-depot` ; nouveau `master` = projet factice avec le kit construit
+depuis la branche du chantier (CI GitHub identique au gabarit), plus le même contrôle `essai-echec`. Ruleset désactivé ;
+protection classique telle que la pose `drwil guarantees --protect` (`checks` exigé, `strict: true`, administrateurs
+inclus, PR obligatoire, 0 approbation). La barrière de périmètre du kit exige un cadrage lu dans le commit parent : les
+fichiers d'essai ont été déclarés dans la fiche permanente par la PR #5, verte et fusionnée normalement. Un premier push
+sans ce cadrage a échoué sur cette seule barrière (non compté).
+
+**Observé, push testé avant l'ouverture de la PR** (`ECHEC-SUR-PR` : le push réussit réellement, la PR échoue) :
+
+| PR | Runs push / PR | Observé |
+|---|---|---|
+| #6, sans fusion demandée | 45961247033 / 45961339764 | `UNSTABLE` de 07:51:20 jusqu'à la création du `checks` de la PR (07:51:39), puis `BLOCKED` en file, en cours et après son échec (07:51:53) ; fusion normale refusée à 07:53:03 |
+| #7, `--auto` dès l'ouverture | 45969286634 / 45969394631 | `CLEAN` à 08:55:02, `gh pr merge --auto --merge` : **PR fusionnée à 08:55:04**, immédiatement : l'historique de la PR ne porte aucun évènement de fusion automatique (vérifié) ; le `checks` de la PR, apparu à 08:55:12, **échoue** à 08:55:25 (`essai-echec`) |
+
+**Observé, push puis PR aussitôt** (`ECHEC-TOUJOURS`, fusion automatique dès l'ouverture) :
+
+- PR #8 (runs 45978233529 / 45978241821) : le push se dit sauté (notice à 09:59:17) ; son `checks` (140435353785)
+  **réussit à vide**, seule l'étape « Refuse a plan or a slice… » jouée. Il finit à 09:59:26, une seconde après le
+  `started_at` du `checks` de la PR : jamais `UNSTABLE`, `BLOCKED` jusqu'après l'échec (09:59:39).
+- PR #9 (runs 45978642572 / 45978648485) : même succès à vide (140436692807, 10:02:15) ; **`UNSTABLE` à 10:02:17**,
+  le `checks` de la PR pas encore créé ; il apparaît à 10:02:18 ; à 10:02:19 GitHub désactive la fusion automatique
+  (`protected_branch`) ; échec à 10:02:37, PR non fusionnée.
+- PR #10 et #11 : deux essais de fusion à la main dans la fenêtre, sans résultat. Sur la #11, 78 tentatives refusées, le
+  succès à vide étant arrivé trop tard ; sur la #10, la boucle d'observation n'a vu aucun état fusionnable.
+
+**Déduit** : même course que sur la CI du dépôt ; un succès à vide arrivé avant la création du `checks` de la PR rend
+celle-ci fusionnable. **Une fusion aboutie avec ce succès à vide n'est pas obtenue** ; la fusion aboutie sur la CI
+livrée est celle de la PR #7. `strict: true` ne l'a pas empêchée.
+
+### Ce qu'on sait des trois temps
+
+- **Avant** la création du `checks` de la PR : fusionnable dès qu'un autre `checks` réussi ou sauté existe sur le
+  commit ; fusions abouties : #3 (dépôt, à la main) et #7 (livrée, commande `--auto` exécutée en fusion immédiate).
+  **Une fusion par une fusion automatique restée programmée n'a été obtenue dans aucun essai.**
+- **Pendant** : `BLOCKED` observé (#2, #6, #8, #9). **Après** l'échec : `BLOCKED` observé (#2, #6, #8), y compris après
+  relance du run push (#2).
+- La fusion automatique tentée trop tard est désactivée par GitHub (#2, #9) alors qu'elle avait été annoncée
+  programmée.
+- Non essayés : PR de code sur la CI du dépôt ; push testé avant la PR sur la CI du dépôt (déduit identique, son push
+  ne rejouant pas les contrôles avec les hooks de la branche principale).
+
+### Options pour P1 (tranché le 2026-11-27 : D)
+
+- **A. Renommer la seule exécution sautée.** Peu coûteux, noms exigés inchangés, saut conservé. **Insuffisant** : le
+  push testé avant la PR n'est pas sauté et son succès, sous le nom exigé, suffit à fusionner (#7).
+- **B. Ne pas émettre les noms exigés sur un push avec PR.** Un déclencheur ignore qu'une PR existe : revient à A ou à
+  deux workflows. Même insuffisance tant qu'un push antérieur à la PR émet ces noms.
+- **C. Abandonner le saut.** Double passage (payant pour un adoptant en dépôt privé), QUA-121 et QUA-263 renversés.
+  **Insuffisant** (déduit de #7) : un `checks` de push réellement réussi compte avant celui de la PR.
+- **D. Nommer selon l'événement** : seuls les runs `pull_request` et les push de la branche principale rapportent
+  `checks` ; tout autre run rapporte `checks (push)`. Dans le dépôt, même suffixe pour les `kit-tests (<os>)`. Le saut
+  reste : pas de double passage ; une branche sans PR reste testée, sous l'autre nom.
+  - **Essayé sur la CI livrée** (une ligne `name:` sur le job `checks`) : PR #12 verte, portant le changement, fusionnée
+    normalement (`checks` et `checks (push)` réussis) ; PR #13, push testé avant la PR et fusion automatique dès
+    l'ouverture (runs 46058345022 / 46058408636) : `checks (push)` réussi à 19:40:47, PR ouverte à 19:40:59,
+    **`BLOCKED` à chaque relevé** avant, pendant et après l'échec du `checks` (19:41:30), jamais `UNSTABLE`, fusion
+    automatique restée armée ; fusion normale refusée après l'échec.
+  - **Non essayé** : D sur la CI du dépôt et le suffixe des `kit-tests` ; push puis PR aussitôt sous D (déduit : même
+    expression, qui ignore le saut). Dans le dépôt, `checks` sauté par sa condition garde un nom à vérifier : évalué ou
+    laissé en expression, il ne devrait pas valoir `checks` sur un push de branche (déduit).
+  - **Adoptants** : le nom exigé `checks` ne change pas et vient de la PR ; effet à la mise à jour du kit, à annoncer au
+    changelog. À examiner : une règle ou un outil qui attendrait `checks` d'un run autre que ces deux-là (file de fusion
+    `merge_group`, non déclenchée par le workflow livré ; lancement manuel du workflow du dépôt sur une branche).
+- **Recommandation : D.** Seule des quatre à couvrir les deux chemins vers la fusion prématurée, essayée avec succès sur
+  la CI livrée, sans double passage ni changement des noms exigés. Limite de toute option fondée sur les noms (déduit) :
+  un autre run `pull_request` réussi sur le même commit (autre base, par exemple) rapporte aussi `checks`.
+
+## 9. Constat du lot 2 (D sur la CI du dépôt)
+
+Dépôt d'essai, heures UTC du 2026-11-27. Montage : `etat-depot` (`301c43dd`) protégée par les quatre noms exigés
+(protection classique, `strict` à faux, administrateurs inclus) ; seuls le workflow de `a62db940` et un fichier
+d'échec volontaire sont ajoutés aux branches d'essai.
+
+- **Push puis PR aussitôt** (PR #14, fusion automatique dès l'ouverture à 20:24:50, runs push 46063455652 et PR
+  46063461619, commit `5b9d8f53`) : le push s'est sauté. Son `checks` sauté s'affiche sous l'expression non évaluée
+  (`(github.event_name == 'pull_request' || …) && 'checks' || 'checks (push)'`), qui n'est aucun nom exigé ; son
+  `kit-tests`, réussi sans tester, s'appelle `kit-tests (ubuntu-latest) (push)`. Le run `pull_request` rapporte `checks`
+  et les trois `kit-tests (<os>)` sans suffixe. `BLOCKED` à chaque relevé (toutes les 15 s) avant, pendant et après
+  l'échec de `checks` (20:39:44) ; fusion automatique restée programmée, aucun évènement de désactivation dans
+  l'historique ; fusion normale refusée à 20:40:01. PR fermée ensuite.
+- **Push sans PR** (branche `essai/d-depot-sans-pr`, run 46063804171, commit `62bf2986`) : le push teste, ses jobs
+  s'appellent `checks (push)` et `kit-tests (ubuntu-latest) (push)`.
+- **Échecs de la PR #14**, dus au montage : l'échec volontaire ; le contrôle des miroirs (fichiers d'essai) ; le test
+  QUA-251 de la copie, d'avant le correctif, qui attend `checks` sans `name:`.
+- **Non essayés** : push réellement réussi avant l'ouverture de la PR sur la CI du dépôt ; PR de code ; CI livrée avec
+  l'expression finale (celle des PR #12 et #13 n'avait pas la condition `github.event_name == 'push'`).

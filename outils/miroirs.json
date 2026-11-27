@@ -20,6 +20,7 @@
     "docs/recipes/working-with-branches.md": "Deux phrases propres au dépôt : ses checks sont aussi imposés côté forge (ruleset de master), et un fichier livré s'y modifie dans le gabarit puis s'installe (npm run installer-depot)."
   },
   "propresAuDepot": {
+    "docs/essai/": "Fichiers d’essai jetables de ce dépôt d’essai (échec volontaire).",
     ".github/workflows/codeql.yml": "Analyse statique propre au dépôt drwil (docs/projects/analyse-statique-ci.md) ; le livrable n'en reçoit pas.",
     ".github/workflows/banc.yml": "Mini-banc de ce dépôt, à la demande (QUA-105) : il mesure le livrable, il n'en fait pas partie (QUA-018).",
     ".githooks/*.test.mjs": "Tests des hooks : éprouvent drwil ici, non livrés (principe « livrable léger, dépôt éprouvé », 2026-10-11).",
