@@ -1,0 +1,58 @@
+{
+  "serveAutostart": false,
+  "guaranteeBaseline": [],
+  "projectName": "projet-factice",
+  "projectShort": "factice",
+  "lang": "fr",
+  "layers": [],
+  "contractPrefixes": [
+    "SEC",
+    "QUA"
+  ],
+  "tools": [
+    "claude"
+  ],
+  "ci": "github",
+  "dirs": {
+    "projects": "docs/projects",
+    "intentions": "docs/intentions",
+    "recipes": "docs/recipes",
+    "contracts": "docs/contracts.md",
+    "index": "docs/projects/pending.md"
+  },
+  "stack": [],
+  "checks": [
+    {"id":"essai-echec","name":"essai : échec volontaire","run":"node -e \"const fs=require('fs'),d='docs/essai';const t=fs.existsSync(d)?fs.readdirSync(d).map(f=>fs.readFileSync(d+'/'+f,'utf8')).join(''):'';const ko=t.includes('ECHEC-TOUJOURS')||(t.includes('ECHEC-SUR-PR')&&process.env.GITHUB_EVENT_NAME==='pull_request');if(ko)console.log('ECHEC VOLONTAIRE DE L ESSAI');process.exit(ko?1:0)\"","ciJob":"checks","paths":["**"],"degradable":false,"reuse":"tree"},
+    {
+      "id": "taille-kit",
+      "name": "taille des fichiers du kit : un dépassement avertit, il ne bloque pas",
+      "run": "node .githooks/check-kit-size.mjs"
+    }
+  ],
+  "scopeReminder": "blocking",
+  "transitions": "human",
+  "scopeGate": "blocking",
+  "newRequirements": "blocking",
+  "release": {
+    "mode": "solo"
+  },
+  "layerPrefixes": [
+    "app",
+    "tests",
+    "src",
+    "scripts"
+  ],
+  "codePrefixes": [
+    "scripts",
+    ".githooks",
+    "e2e"
+  ],
+  "extraCodeFiles": [],
+  "extraCodeGlobs": [
+    "docker-compose*.yml"
+  ],
+  "ciFiles": [
+    ".github/workflows/ia-first.yml"
+  ],
+  "mode": "full"
+}
