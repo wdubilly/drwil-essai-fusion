@@ -12,6 +12,7 @@ its path to the `scope` block below; a pattern that's too broad (`**`,
 
 <!-- scope
 files:
+  - .github/workflows/ia-first.yml
   - docs/essai/p1.md
   - docs/essai/p2.md
   - docs/essai/p3.md
