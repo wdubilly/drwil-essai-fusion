@@ -93,6 +93,7 @@ jobs:
       # drwil-project-end shard-steps
   # The job the branch protection requires, name unchanged (QUA-251); it aggregates the slices, and fails if the plan or a slice did not succeed (QUA-013).
   checks:
+    name: ${{ (github.event_name == 'pull_request' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && 'checks' || 'checks (push)' }}
     needs: [plan, shards]
     if: always()
     runs-on: ubuntu-latest
