@@ -12,6 +12,11 @@ its path to the `scope` block below; a pattern that's too broad (`**`,
 
 <!-- scope
 files:
+  - docs/essai/p1.md
+  - docs/essai/p2.md
+  - docs/essai/p3.md
+  - docs/essai/p4.md
+  - docs/essai/p5.md
 -->
 
 ## Log
